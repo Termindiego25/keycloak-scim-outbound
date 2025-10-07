@@ -65,7 +65,7 @@ Once deployed:
 
 | Field                       | Description                                                           | Required |
 | --------------------------- | --------------------------------------------------------------------- | -------- |
-| **SCIM Base URL**           | Base endpoint of your SCIM API, e.g. `https://passbolt.local/scim/v2` | ✅        |
+| **SCIM Base URL**           | Base endpoint of your SCIM API, e.g. `https://app.example.com/scim/v2` | ✅        |
 | **SCIM Token**              | Bearer token for authenticating with the SCIM target                  | ✅        |
 | **Filter Group (optional)** | Only users in this group will be provisioned                          | ❌        |
 | **userName Strategy**       | How to build SCIM `userName` (`username`, `email`, or `attribute`)    | ✅        |
