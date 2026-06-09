@@ -19,6 +19,7 @@ import java.time.Instant;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -151,7 +152,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                                     scimUserName, groupName, changed ? "OK" : "NO-OP");
                         }
                         case DELETE -> { // user REMOVED from group
-                            deactivateUser(client, scimUserName);
+                            deprovisionUser(t, client, userId, scimUserName);
                             logInfo("SCIM", t.getName(), "GROUP REMOVE user=%s group=%s -> OK",
                                     scimUserName, groupName);
                         }
@@ -240,7 +241,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         try {
             boolean changed = switch (action) {
                 case "CREATE", "UPDATE" -> upsertUser(client, user, scimUserName);
-                case "DELETE" -> { deactivateUser(client, userId); yield true; }
+                case "DELETE" -> { deprovisionUser(t, client, userId, scimUserName); yield true; }
                 default -> false;
             };
 
@@ -278,25 +279,58 @@ public class ScimEventListenerProvider implements EventListenerProvider {
 
     /**
      * Returns true if we successfully created or patched the SCIM user.
+     * Prefers externalId for lookup (userName can change with the configured strategy),
+     * falling back to userName for users provisioned before externalId existed.
+     * The PATCH also sets externalId when missing, so legacy users get it on update.
      */
     private boolean upsertUser(ScimClient scim, UserModel user, String scimUserName) {
         if (user == null) return false;
 
-        var existingId = scim.findUserIdByUserName(scimUserName);
+        final String externalId = user.getId();
+        var existingId = resolveScimId(scim, externalId, scimUserName);
         if (existingId.isEmpty()) {
             boolean created = scim.createUser(ScimMapper.buildCreateUser(user, scimUserName));
             if (created) return true;
 
             // Creation failed (likely 409). Re-resolve and PATCH.
-            existingId = scim.findUserIdByUserName(scimUserName);
-            return existingId.map(id -> scim.patchUser(id, ScimMapper.buildPatchUser(user))).orElse(false);
+            existingId = resolveScimId(scim, externalId, scimUserName);
+            return existingId.map(id -> scim.patchUser(id, ScimMapper.buildPatchUser(user, externalId))).orElse(false);
         } else {
-            return scim.patchUser(existingId.get(), ScimMapper.buildPatchUser(user));
+            return scim.patchUser(existingId.get(), ScimMapper.buildPatchUser(user, externalId));
         }
     }
 
-    private void deactivateUser(ScimClient scim, String externalId) {
-        scim.findUserIdByExternalId(externalId).ifPresent(scim::deleteUser);
+    /**
+     * Deprovision a user according to the target's configured behavior:
+     *  - "delete"     -> hard DELETE /Users/{id}
+     *  - "deactivate" -> PATCH active=false (default, documented behavior)
+     * Resolves the SCIM id by externalId first, then by userName as a fallback.
+     */
+    private void deprovisionUser(ComponentModel t, ScimClient scim, String externalId, String scimUserName) {
+        var id = resolveScimId(scim, externalId, scimUserName);
+        if (id.isEmpty()) {
+            logInfo("SCIM", t.getName(), "Deprovision NO-OP: user not found (externalId=%s userName=%s)",
+                    externalId, scimUserName);
+            return;
+        }
+
+        String mode = get(t, CFG_DEPROVISION, "deactivate");
+        if ("delete".equals(mode)) {
+            scim.deleteUser(id.get());
+        } else {
+            scim.patchUser(id.get(), ScimMapper.buildDeactivatePatch());
+        }
+    }
+
+    /** Prefer externalId lookup; fall back to userName for legacy users without externalId. */
+    private Optional<String> resolveScimId(ScimClient scim, String externalId, String scimUserName) {
+        Optional<String> id = (externalId != null && !externalId.isBlank())
+                ? scim.findUserIdByExternalId(externalId)
+                : Optional.empty();
+        if (id.isEmpty() && scimUserName != null && !scimUserName.isBlank()) {
+            id = scim.findUserIdByUserName(scimUserName);
+        }
+        return id;
     }
 
     private static String extractUserId(String resourcePath) {

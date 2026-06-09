@@ -30,6 +30,9 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
     /** Attribute name when strategy=attribute */
     public static final String CFG_UNAME_ATTR     = "userNameAttribute";
 
+    /** Deprovisioning behavior on delete / group removal: deactivate | delete */
+    public static final String CFG_DEPROVISION    = "deprovisionAction";
+
     private static ProviderConfigProperty list(String help, String name, List<String> options, String def, boolean required) {
         ProviderConfigProperty p = new ProviderConfigProperty();
         p.setType(ProviderConfigProperty.LIST_TYPE);
@@ -54,7 +57,11 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
             CFG_UNAME_STRATEGY, List.of("username","email","attribute"), "username", true),
 
         prop(ProviderConfigProperty.STRING_TYPE,  CFG_UNAME_ATTR,
-            "User attribute name to read when 'userNameStrategy=attribute' (e.g. scim_username).", false, "UserName Attribute")
+            "User attribute name to read when 'userNameStrategy=attribute' (e.g. scim_username).", false, "UserName Attribute"),
+
+        list("Deprovisioning behavior when a user is deleted or removed from the filter group: "
+            + "'deactivate' (PATCH active=false, default) or 'delete' (DELETE /Users/{id}, e.g. for vCenter).",
+            CFG_DEPROVISION, List.of("deactivate","delete"), "deactivate", true)
     );
 
     @Override
@@ -96,6 +103,11 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
                 break;
             default:
                 throw new ComponentValidationException("Invalid userNameStrategy. Use 'username', 'email', or 'attribute'.");
+        }
+
+        String deprovision = get(model, CFG_DEPROVISION, "deactivate");
+        if (!"deactivate".equals(deprovision) && !"delete".equals(deprovision)) {
+            throw new ComponentValidationException("Invalid deprovisionAction. Use 'deactivate' or 'delete'.");
         }
     }
 

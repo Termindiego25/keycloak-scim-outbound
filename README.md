@@ -70,6 +70,7 @@ Once deployed:
 | **Filter Group (optional)** | Only users in this group will be provisioned                          | ❌        |
 | **userName Strategy**       | How to build SCIM `userName` (`username`, `email`, or `attribute`)    | ✅        |
 | **userName Attribute**      | Custom user attribute name (only if strategy = `attribute`)           | ❌        |
+| **Deprovision Action**      | What to do on delete / group removal: `deactivate` (PATCH `active=false`, default) or `delete` (`DELETE /Users/{id}`) | ✅        |
 
 ---
 
@@ -80,9 +81,11 @@ Once deployed:
 | **REGISTER**                      | Create new SCIM user                                                            |
 | **UPDATE_PROFILE / UPDATE_EMAIL** | Update SCIM user fields                                                         |
 | **UPDATE_CREDENTIAL (password)**  | Patch password if supported                                                     |
-| **DELETE_ACCOUNT**                | Deactivate SCIM user                                                            |
+| **DELETE_ACCOUNT**                | Deprovision SCIM user (deactivate or delete, per *Deprovision Action*)          |
 | **Admin CREATE/UPDATE/DELETE**    | Sync CRUD operations                                                            |
 | **Group membership add/remove**   | Provision/deprovision users based on group membership (if `filterGroup` is set) |
+
+> ℹ️ **Lifecycle lookup & deprovisioning:** users are matched by SCIM `externalId` (the Keycloak user id) first, falling back to `userName` for users provisioned before `externalId` existed. The `externalId` is also backfilled on update for legacy users. Deprovisioning defaults to **deactivate** (`PATCH active=false`); set *Deprovision Action* to `delete` for providers that require a hard delete (e.g. VMware vCenter).
 
 ---
 
