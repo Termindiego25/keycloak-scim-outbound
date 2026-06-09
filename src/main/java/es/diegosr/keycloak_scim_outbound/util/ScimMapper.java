@@ -18,21 +18,23 @@ public final class ScimMapper {
 
     /** Build SCIM User JSON for POST /Users with explicit SCIM userName (strategy-based). */
     public static String buildCreateUser(UserModel user, String scimUserName) {
-        final String given    = esc(nvl(user != null ? user.getFirstName()  : null));
-        final String family   = esc(nvl(user != null ? user.getLastName()   : null));
-        final String email    = esc(nvl(user != null ? user.getEmail()      : null));
-        final String uname    = esc(nvl(scimUserName));
-        final String active   = (user != null && user.isEnabled()) ? "true" : "false";
+        final String given     = esc(nvl(user != null ? user.getFirstName()  : null));
+        final String family    = esc(nvl(user != null ? user.getLastName()   : null));
+        final String email     = esc(nvl(user != null ? user.getEmail()      : null));
+        final String uname     = esc(nvl(scimUserName));
+        final String extId     = esc(nvl(user != null ? user.getId()         : null));
+        final String active    = (user != null && user.isEnabled()) ? "true" : "false";
 
         return """
             {
               "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+              "externalId": "%s",
               "userName": "%s",
               "name": { "givenName": "%s", "familyName": "%s" },
               "emails": [ { "value": "%s", "type": "work", "primary": true } ],
               "active": %s
             }
-            """.formatted(uname, given, family, email, active);
+            """.formatted(extId, uname, given, family, email, active);
     }
 
     /** Build SCIM PatchOp JSON for PATCH /Users/{id}. */
