@@ -83,6 +83,33 @@ public class ScimClient {
         return Optional.empty();
     }
 
+    /** Find user by externalId and return SCIM id if present. */
+    public Optional<String> findUserIdByExternalId(String externalId) {
+        try {
+            String filter = String.format("externalId eq \"%s\"", externalId);
+            String query = "filter=" + urlEncode(filter);
+            HttpRequest req = baseRequestBuilder("/Users?" + query).GET().build();
+
+            HttpResponse<String> res = sendWithRetries(req);
+            if (is2xx(res.statusCode())) {
+                String body = res.body();
+                int total = JsonMini.totalResults(body);
+                httpInfo("GET /Users?%s -> %d totalResults=%d", query, res.statusCode(), total);
+                if (total > 0) {
+                    Matcher m = RE_FIRST_ID_IN_RESOURCES.matcher(body);
+                    if (m.find()) {
+                        return Optional.ofNullable(m.group(1));
+                    }
+                }
+            } else {
+                httpErr("GET /Users?%s -> %d %s", query, res.statusCode(), safeBody(res));
+            }
+        } catch (Exception e) {
+            httpErr("findUserIdByExternalId failed: %s", e.getMessage());
+        }
+        return Optional.empty();
+    }
+
     /** Create SCIM user; returns true on 201/200. */
     public boolean createUser(String jsonPayload) {
         try {

@@ -240,7 +240,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         try {
             boolean changed = switch (action) {
                 case "CREATE", "UPDATE" -> upsertUser(client, user, scimUserName);
-                case "DELETE" -> { deactivateUser(client, scimUserName); yield true; }
+                case "DELETE" -> { deactivateUser(client, userId); yield true; }
                 default -> false;
             };
 
@@ -295,9 +295,8 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         }
     }
 
-    private void deactivateUser(ScimClient scim, String scimUserName) {
-        var existingId = scim.findUserIdByUserName(scimUserName);
-        existingId.ifPresent(id -> scim.patchUser(id, ScimMapper.buildDeactivatePatch()));
+    private void deactivateUser(ScimClient scim, String externalId) {
+        scim.findUserIdByExternalId(externalId).ifPresent(scim::deleteUser);
     }
 
     private static String extractUserId(String resourcePath) {
