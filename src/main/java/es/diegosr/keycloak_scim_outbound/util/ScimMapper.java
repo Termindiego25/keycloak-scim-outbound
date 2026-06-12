@@ -18,41 +18,56 @@ public final class ScimMapper {
 
     /** Build SCIM User JSON for POST /Users with explicit SCIM userName (strategy-based). */
     public static String buildCreateUser(UserModel user, String scimUserName) {
-        final String given    = esc(nvl(user != null ? user.getFirstName()  : null));
-        final String family   = esc(nvl(user != null ? user.getLastName()   : null));
-        final String email    = esc(nvl(user != null ? user.getEmail()      : null));
-        final String uname    = esc(nvl(scimUserName));
-        final String active   = (user != null && user.isEnabled()) ? "true" : "false";
+        final String given     = esc(nvl(user != null ? user.getFirstName()  : null));
+        final String family    = esc(nvl(user != null ? user.getLastName()   : null));
+        final String email     = esc(nvl(user != null ? user.getEmail()      : null));
+        final String uname     = esc(nvl(scimUserName));
+        final String extId     = esc(nvl(user != null ? user.getId()         : null));
+        final String active    = (user != null && user.isEnabled()) ? "true" : "false";
 
         return """
             {
               "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+              "externalId": "%s",
               "userName": "%s",
               "name": { "givenName": "%s", "familyName": "%s" },
               "emails": [ { "value": "%s", "type": "work", "primary": true } ],
               "active": %s
             }
-            """.formatted(uname, given, family, email, active);
+            """.formatted(extId, uname, given, family, email, active);
     }
 
-    /** Build SCIM PatchOp JSON for PATCH /Users/{id}. */
+    /** Backward-compatible wrapper: PATCH without touching externalId. */
     public static String buildPatchUser(UserModel user) {
+        return buildPatchUser(user, null);
+    }
+
+    /**
+     * Build SCIM PatchOp JSON for PATCH /Users/{id}.
+     * When {@code externalId} is provided, an "add" op is included so already-provisioned
+     * users that lack an externalId get one set on update/upsert.
+     */
+    public static String buildPatchUser(UserModel user, String externalId) {
         final String given  = esc(nvl(user != null ? user.getFirstName() : null));
         final String family = esc(nvl(user != null ? user.getLastName()  : null));
         final String email  = esc(nvl(user != null ? user.getEmail()     : null));
         final String active = (user != null && user.isEnabled()) ? "true" : "false";
+        final String extId  = esc(nvl(externalId));
 
-        return """
-            {
-              "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
-              "Operations": [
-                {"op":"replace","path":"name.givenName","value":"%s"},
-                {"op":"replace","path":"name.familyName","value":"%s"},
-                {"op":"replace","path":"emails[primary eq true].value","value":"%s"},
-                {"op":"replace","path":"active","value":%s}
-              ]
-            }
-            """.formatted(given, family, email, active);
+        StringBuilder ops = new StringBuilder();
+        if (!extId.isEmpty()) {
+            ops.append("    {\"op\":\"add\",\"path\":\"externalId\",\"value\":\"").append(extId).append("\"},\n");
+        }
+        ops.append("    {\"op\":\"replace\",\"path\":\"name.givenName\",\"value\":\"").append(given).append("\"},\n");
+        ops.append("    {\"op\":\"replace\",\"path\":\"name.familyName\",\"value\":\"").append(family).append("\"},\n");
+        ops.append("    {\"op\":\"replace\",\"path\":\"emails[primary eq true].value\",\"value\":\"").append(email).append("\"},\n");
+        ops.append("    {\"op\":\"replace\",\"path\":\"active\",\"value\":").append(active).append("}");
+
+        return "{\n"
+             + "  \"schemas\": [\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\n"
+             + "  \"Operations\": [\n"
+             + ops
+             + "\n  ]\n}\n";
     }
 
     /** Patch to deactivate (active=false). */
