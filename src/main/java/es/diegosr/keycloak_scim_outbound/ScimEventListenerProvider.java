@@ -152,9 +152,9 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                                     scimUserName, groupName, changed ? "OK" : "NO-OP");
                         }
                         case DELETE -> { // user REMOVED from group
-                            deprovisionUser(t, client, userId, scimUserName);
-                            logInfo("SCIM", t.getName(), "GROUP REMOVE user=%s group=%s -> OK",
-                                    scimUserName, groupName);
+                            boolean changed = deprovisionUser(t, client, userId, scimUserName);
+                            logInfo("SCIM", t.getName(), "GROUP REMOVE user=%s group=%s -> %s",
+                                    scimUserName, groupName, changed ? "OK" : "NO-OP");
                         }
                         default -> {
                             // ignore UPDATE/others
@@ -241,7 +241,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         try {
             boolean changed = switch (action) {
                 case "CREATE", "UPDATE" -> upsertUser(client, user, scimUserName);
-                case "DELETE" -> { deprovisionUser(t, client, userId, scimUserName); yield true; }
+                case "DELETE" -> deprovisionUser(t, client, userId, scimUserName);
                 default -> false;
             };
 
@@ -306,20 +306,32 @@ public class ScimEventListenerProvider implements EventListenerProvider {
      *  - "deactivate" -> PATCH active=false (default, documented behavior)
      * Resolves the SCIM id by externalId first, then by userName as a fallback.
      */
-    private void deprovisionUser(ComponentModel t, ScimClient scim, String externalId, String scimUserName) {
+    private boolean deprovisionUser(ComponentModel t, ScimClient scim, String externalId, String scimUserName) {
         var id = resolveScimId(scim, externalId, scimUserName);
         if (id.isEmpty()) {
             logInfo("SCIM", t.getName(), "Deprovision NO-OP: user not found (externalId=%s userName=%s)",
                     externalId, scimUserName);
-            return;
+            return false;
         }
 
         String mode = get(t, CFG_DEPROVISION, "deactivate");
+        String effectiveMode = mode;
+        boolean ok;
         if ("delete".equals(mode)) {
-            scim.deleteUser(id.get());
+            ok = scim.deleteUser(id.get());
+        } else if ("deactivate".equals(mode)) {
+            ok = scim.patchUser(id.get(), ScimMapper.buildDeactivatePatch());
         } else {
-            scim.patchUser(id.get(), ScimMapper.buildDeactivatePatch());
+            logErr("SCIM", t.getName(), "Invalid deprovisionAction=%s; falling back to deactivate", mode);
+            effectiveMode = "deactivate";
+            ok = scim.patchUser(id.get(), ScimMapper.buildDeactivatePatch());
         }
+        if (!ok) {
+            throw new IllegalStateException(String.format(
+                    "deprovision %s failed for scimId=%s externalId=%s userName=%s",
+                    effectiveMode, id.get(), externalId, scimUserName));
+        }
+        return ok;
     }
 
     /** Prefer externalId lookup; fall back to userName for legacy users without externalId. */
