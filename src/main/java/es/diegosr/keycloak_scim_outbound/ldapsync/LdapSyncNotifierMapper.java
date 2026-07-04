@@ -130,11 +130,12 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
     public void beforeLDAPQuery(LDAPQuery query) { }
 
     @Override
+    public java.util.Set<String> mandatoryAttributeNames() {
+        return java.util.Collections.emptySet();
+    }
+
+    @Override
     public java.util.Set<String> getUserAttributes() {
-        // This mapper does not map any LDAP attribute onto the Keycloak user model;
-        // it only writes an internal bookkeeping attribute (MembershipState.ATTRIBUTE_NAME)
-        // after group membership has already been computed by the group-ldap-mapper.
-        // Per LDAPStorageMapper contract: never return null, empty set if nothing provided.
         return java.util.Collections.emptySet();
     }
 
