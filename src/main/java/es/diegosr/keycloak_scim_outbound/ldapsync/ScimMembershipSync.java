@@ -37,8 +37,14 @@ import java.util.Optional;
  * MembershipState.PENDING_ATTRIBUTE_NAME (values "<componentId>:1", maintained by
  * LdapSyncNotifierMapper) and looks candidates up per-target via
  * searchForUserByUserAttributeStream(realm, PENDING_ATTRIBUTE_NAME, "<componentId>:1"),
- * which is an indexed DB/federated-storage lookup, not a full scan. Only users actually
+ * which is an indexed local-storage lookup, not a full scan. Only users actually
  * flagged pending for a given target are loaded and processed.
+ *
+ * NOTE: the lookup above is always run against UserStoragePrivateUtil.userLocalStorage(session),
+ * never the aggregated session.users(). PENDING_ATTRIBUTE_NAME is a local bookkeeping
+ * attribute with no meaning to any federated provider; searching it through the
+ * aggregated view causes federated providers (e.g. the LDAP provider) to push the
+ * attribute into their own native query, which fails for attributes they don't recognize.
  */
 public final class ScimMembershipSync {
 
@@ -80,8 +86,15 @@ public final class ScimMembershipSync {
             // Indexed lookup: only users flagged pending for THIS target, instead of
             // scanning every user in the realm. Replaces the old
             // session.users().searchForUserStream(realm, Map.of()) full scan.
+            //
+            // Queried against local storage only (not the aggregated session.users()),
+            // since PENDING_ATTRIBUTE_NAME is a local bookkeeping attribute, not an LDAP
+            // schema attribute. Searching it via the aggregated view causes the LDAP
+            // federation provider to push the attribute into a raw LDAP filter sent to
+            // AD, which AD rejects with InvalidSearchFilterException. See
+            // LdapSyncNotifierMapper for the same pattern.
             Map<String, UserModel> candidates = new LinkedHashMap<>();
-            session.users()
+            UserStoragePrivateUtil.userLocalStorage(session)
                     .searchForUserByUserAttributeStream(realm, MembershipState.PENDING_ATTRIBUTE_NAME, MembershipState.pendingValue(target.getId()))
                     .forEach(u -> candidates.putIfAbsent(u.getId(), u));
 
