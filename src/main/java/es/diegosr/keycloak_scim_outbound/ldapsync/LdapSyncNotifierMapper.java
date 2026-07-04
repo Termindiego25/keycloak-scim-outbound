@@ -327,18 +327,36 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
             }
 
             // (1) currently in the group -- group-scoped lookup, not a realm-wide scan.
+            // This one legitimately goes through the aggregated session.groups()/
+            // session.users(), since group membership itself is LDAP-backed.
             session.groups().searchForGroupByNameStream(realm, groupName, true, null, null)
                     .forEach(group -> session.users().getGroupMembersStream(realm, group)
                             .forEach(u -> candidates.putIfAbsent(u.getId(), u)));
 
-            // (2) currently pending for this target -- indexed attribute search.
-            session.users().searchForUserByUserAttributeStream(realm, MembershipState.PENDING_ATTRIBUTE_NAME, MembershipState.pendingValue(target.getId()))
+            // (2) and (3) search our own tracking attributes (MembershipState.*), which
+            // are purely local bookkeeping and were never mapped into LDAP. Calling
+            // searchForUserByUserAttributeStream(...) on the aggregated session.users()
+            // (UserStorageManager) fans the query out to EVERY enabled user storage
+            // provider capable of attribute search -- including the AD/LDAP federation
+            // provider -- which then tries to build a native LDAP filter using our
+            // attribute name (e.g. "(ldapSyncNotifier.pending=...)"). AD has no such
+            // attribute, so this throws
+            // javax.naming.directory.InvalidSearchFilterException: "invalid attribute
+            // description". We must query LOCAL storage only, via
+            // UserStoragePrivateUtil.userLocalStorage(session), exactly as we already do
+            // for the writes in persistTrackingAttributes(...).
+
+            // (2) currently pending for this target -- indexed attribute search, local storage only.
+            UserStoragePrivateUtil.userLocalStorage(session)
+                    .searchForUserByUserAttributeStream(realm, MembershipState.PENDING_ATTRIBUTE_NAME, MembershipState.pendingValue(target.getId()))
                     .forEach(u -> candidates.putIfAbsent(u.getId(), u));
 
             // (3) last known as an active (SENT) member of this target -- indexed
             // attribute search on the exact tracked value, so we can detect departures.
+            // Local storage only, for the same reason as (2) above.
             String sentValue = new MembershipState(target.getId(), groupName, MembershipState.State.SENT).toValue();
-            session.users().searchForUserByUserAttributeStream(realm, MembershipState.ATTRIBUTE_NAME, sentValue)
+            UserStoragePrivateUtil.userLocalStorage(session)
+                    .searchForUserByUserAttributeStream(realm, MembershipState.ATTRIBUTE_NAME, sentValue)
                     .forEach(u -> candidates.putIfAbsent(u.getId(), u));
         }
 
