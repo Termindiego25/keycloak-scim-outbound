@@ -7,6 +7,7 @@ import org.keycloak.models.GroupModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
+import org.keycloak.storage.UserStoragePrivateUtil;
 import org.keycloak.storage.ldap.LDAPStorageProvider;
 import org.keycloak.storage.ldap.idm.model.LDAPObject;
 import org.keycloak.storage.ldap.idm.query.internal.LDAPQuery;
@@ -47,6 +48,16 @@ import java.util.Optional;
  *
  * The actual SCIM push happens elsewhere (ScimMembershipSync), triggered by a timer or
  * by the SCIM target's own "Synchronize" action -- this class never calls out to SCIM.
+ *
+ * WRITE SAFETY: when the LDAP provider's edit mode is READ_ONLY (or the built-in
+ * group-ldap-mapper mode causes Keycloak to wrap the user in a
+ * ReadonlyLDAPUserModelDelegate during sync), calling setAttribute(...) directly on the
+ * UserModel passed in by the LDAP sync machinery throws
+ * org.keycloak.storage.ReadOnlyException: "Federated storage is not writable". Our
+ * tracking attribute (MembershipState.ATTRIBUTE_NAME) is a purely local bookkeeping
+ * value that has nothing to do with LDAP, so we must bypass that read-only delegate
+ * and write it directly on Keycloak's LOCAL user storage instead, via
+ * UserStoragePrivateUtil.userLocalStorage(session).
  */
 public class LdapSyncNotifierMapper implements LDAPStorageMapper {
 
@@ -122,11 +133,41 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
         }
 
         if (changed) {
-            user.setAttribute(MembershipState.ATTRIBUTE_NAME, currentValues);
-            info("Persisted attribute '%s' for user=%s -> %s", MembershipState.ATTRIBUTE_NAME, user.getUsername(), currentValues);
+            persistTrackingAttribute(realm, user, currentValues);
         } else {
             debug("No attribute changes for user=%s.", user.getUsername());
         }
+    }
+
+    /**
+     * Writes MembershipState.ATTRIBUTE_NAME on Keycloak's LOCAL user storage, bypassing
+     * whatever read-only/federated UserModel delegate the LDAP sync machinery handed us.
+     * This is required because during LDAP sync (especially with edit mode READ_ONLY,
+     * or when the built-in group-ldap-mapper wraps the user), calling setAttribute(...)
+     * directly on the passed-in UserModel throws
+     * org.keycloak.storage.ReadOnlyException: "Federated storage is not writable" --
+     * even though our attribute is purely local bookkeeping and has nothing to do with
+     * the LDAP-mapped fields.
+     */
+    private void persistTrackingAttribute(RealmModel realm, UserModel user, List<String> values) {
+        UserModel localUser = UserStoragePrivateUtil.userLocalStorage(session).getUserById(realm, user.getId());
+
+        if (localUser == null) {
+            // Fallback: could not resolve a local storage reference (should not normally
+            // happen since the user must already be imported locally to be enumerated
+            // here). Try the delegate directly as a last resort; if the store really is
+            // read-only this will throw, and we at least log why.
+            info("Could not resolve local storage user for id=%s (username=%s); attempting direct setAttribute as fallback.",
+                    user.getId(), user.getUsername());
+            user.setAttribute(MembershipState.ATTRIBUTE_NAME, values);
+            info("Persisted attribute '%s' for user=%s -> %s (via federated delegate fallback)",
+                    MembershipState.ATTRIBUTE_NAME, user.getUsername(), values);
+            return;
+        }
+
+        localUser.setAttribute(MembershipState.ATTRIBUTE_NAME, values);
+        info("Persisted attribute '%s' for user=%s -> %s (via local storage)",
+                MembershipState.ATTRIBUTE_NAME, user.getUsername(), values);
     }
 
     /* ===== Required LDAPStorageMapper methods (no-ops, this mapper only observes) ===== */
