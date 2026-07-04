@@ -41,8 +41,14 @@ public class ScimEventListenerProviderFactory implements EventListenerProviderFa
             debug("Timer tick: starting sweep across all realms.");
             long tickStart = System.currentTimeMillis();
             KeycloakModelUtils.runJobInTransaction(factory, session ->
-                    session.realms().getRealmsStream().forEach(realm ->
-                            ScimMembershipSync.processPendingMembershipChanges(session, realm, null)));
+                    session.realms().getRealmsStream().forEach(realm -> {
+                        // Bind the realm to the session context first -- without this,
+                        // code paths relying on session.getContext().getRealm() (e.g. LDAP
+                        // provider lookups triggered indirectly during the sweep) fail with
+                        // "Session not bound to a realm".
+                        session.getContext().setRealm(realm);
+                        ScimMembershipSync.processPendingMembershipChanges(session, realm, null);
+                    }));
             debug("Timer tick: sweep finished in %dms.", System.currentTimeMillis() - tickStart);
         }, INTERVAL_MS, "scim-outbound-ldap-membership-sweep");
     }
