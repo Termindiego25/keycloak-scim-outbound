@@ -20,10 +20,36 @@ public record MembershipState(String componentId, String groupName, State state)
 
     public static final String ATTRIBUTE_NAME = "ldapSyncNotifier.filterGroupMembership";
 
+    /**
+     * Lightweight multi-valued "work queue" attribute, separate from ATTRIBUTE_NAME above.
+     * Each value is "<componentId>:1", present exactly when that user has at least one
+     * un-SENT (NEW_ADDED/NEW_DELETED) entry for that SCIM target in ATTRIBUTE_NAME.
+     *
+     * This exists purely so ScimMembershipSync can find "users with pending work" via a
+     * single indexed searchForUserByUserAttributeStream(realm, PENDING_ATTRIBUTE_NAME, ...)
+     * call per target, instead of iterating every user in the realm (which does not scale --
+     * e.g. 941 users -- and was the original performance problem).
+     *
+     * Lifecycle:
+     *   - SET by LdapSyncNotifierMapper whenever it marks a NEW_ADDED/NEW_DELETED transition
+     *     for a given (user, componentId) pair.
+     *   - CLEARED by ScimMembershipSync once that user has no more un-SENT entries for that
+     *     componentId (i.e. the pending push/deprovision succeeded).
+     */
+    public static final String PENDING_ATTRIBUTE_NAME = "ldapSyncNotifier.pending";
+
     public enum State { NEW_ADDED, NEW_DELETED, SENT }
 
     public String toValue() {
         return componentId + ":" + groupName + ":" + state.name();
+    }
+
+    /**
+     * Value to add to PENDING_ATTRIBUTE_NAME to flag that componentId has pending work
+     * for a user.
+     */
+    public static String pendingValue(String componentId) {
+        return componentId + ":1";
     }
 
     public static Optional<MembershipState> parse(String value) {
