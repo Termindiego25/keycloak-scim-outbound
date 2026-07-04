@@ -160,6 +160,10 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
                     err("Realm not found for realmId=%s during manual sync of target=%s", realmId, model.getName());
                     return;
                 }
+                // The session created by runJobInTransaction has no realm bound to its context yet.
+                // Downstream code (e.g. UserModel#setAttribute, group lookups) relies on
+                // session.getContext().getRealm() being set, so bind it explicitly before use.
+                session.getContext().setRealm(realm);
                 ScimMembershipSync.processPendingMembershipChanges(session, realm, model.getId());
             });
             info("Manual sync for target=%s completed in %dms", model.getName(), System.currentTimeMillis() - start);
