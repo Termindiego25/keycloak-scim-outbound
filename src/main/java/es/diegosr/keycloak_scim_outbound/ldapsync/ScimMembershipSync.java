@@ -8,6 +8,7 @@ import org.keycloak.component.ComponentModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
+import org.keycloak.storage.UserStoragePrivateUtil;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -165,8 +166,19 @@ public final class ScimMembershipSync {
             if (hadPendingForThisUser) usersWithPending++;
 
             if (userChanged) {
-                user.setAttribute(MembershipState.ATTRIBUTE_NAME, updatedValues);
-                debug("Updated attribute for user=%s -> %s", user.getUsername(), updatedValues);
+                // Write through local storage: the user object here comes from
+                // session.users() and may be a federated (e.g. read-only LDAP) view.
+                // Writing directly to it throws ReadOnlyException when the LDAP
+                // provider's edit mode is READ_ONLY. See LdapSyncNotifierMapper for
+                // the same pattern.
+                UserModel localUser = UserStoragePrivateUtil.userLocalStorage(session).getUserById(realm, user.getId());
+                if (localUser != null) {
+                    localUser.setAttribute(MembershipState.ATTRIBUTE_NAME, updatedValues);
+                    debug("Updated attribute for user=%s -> %s (via local storage)", user.getUsername(), updatedValues);
+                } else {
+                    err("Could not resolve local storage user for id=%s (username=%s); attribute update skipped.",
+                            user.getId(), user.getUsername());
+                }
             }
         }
 
