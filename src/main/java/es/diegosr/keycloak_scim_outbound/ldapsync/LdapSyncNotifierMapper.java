@@ -16,6 +16,7 @@ import org.keycloak.storage.user.SynchronizationResult;
 import javax.naming.AuthenticationException;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -25,10 +26,20 @@ import java.util.Optional;
  * pending state change ("NEW_ADDED" / "NEW_DELETED") whenever that membership differs
  * from what was last recorded.
  *
- * This mapper is invoked by Keycloak's LDAP federation provider during BOTH:
- *   - manual "Synchronize all users" / "Synchronize changed users" actions, and
- *   - periodic background sync (full or changed-users-only),
- * neither of which fire a normal Event/AdminEvent for group membership changes.
+ * There are TWO entry points that can trigger this check, because Keycloak's LDAP
+ * federation layer does not consistently notify per-user mappers of group membership
+ * changes -- it depends on the built-in group-ldap-mapper's configured Mode:
+ *
+ *   - onImportUserFromLDAP(...): fires per user during "Synchronize all/changed users"
+ *     ONLY when the group-ldap-mapper is running in IMPORT mode (membership gets
+ *     written into Keycloak's local user/group tables during per-user import).
+ *
+ *   - syncDataFromFederationProviderToKeycloak(...): fires once per full LDAP sync run.
+ *     This is the ONLY reliable hook when group-ldap-mapper is in LDAP_ONLY (or
+ *     READ_ONLY) mode, because in that mode membership is computed live from LDAP via
+ *     user.getGroupsStream() and never routed through the per-user import callback.
+ *     We use this hook to iterate all local users ourselves and re-run the same
+ *     membership diff logic.
  *
  * IMPORTANT: this mapper must be ordered AFTER the built-in "group-ldap-mapper" in the
  * LDAP provider's Mappers list, so that user.getGroupsStream() already reflects the
@@ -52,7 +63,15 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
     @Override
     public void onImportUserFromLDAP(LDAPObject ldapUser, UserModel user, RealmModel realm, boolean isCreate) {
         debug("onImportUserFromLDAP fired: user=%s isCreate=%s realm=%s", user.getUsername(), isCreate, realm.getName());
+        checkAndUpdateMembership(realm, user);
+    }
 
+    /**
+     * Re-checks group membership for a single user against all configured SCIM targets
+     * and updates the tracking attribute if anything changed. Shared by both
+     * onImportUserFromLDAP (IMPORT mode) and the full-sync sweep below (LDAP_ONLY mode).
+     */
+    private void checkAndUpdateMembership(RealmModel realm, UserModel user) {
         List<ComponentModel> scimTargets = realm.getComponentsStream()
                 .filter(c -> ScimTargetProviderFactory.ID.equals(c.getProviderId()))
                 .toList();
@@ -162,6 +181,30 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
 
     @Override
     public SynchronizationResult syncDataFromFederationProviderToKeycloak(RealmModel realm) {
+        // In LDAP_ONLY (or READ_ONLY) mode, the built-in group-ldap-mapper computes
+        // group membership live from LDAP and does NOT route changes through
+        // onImportUserFromLDAP. This is the only reliable hook we get for a full sync
+        // in that mode, so we iterate all local users here and re-run the same
+        // membership diff logic used in onImportUserFromLDAP.
+        info("syncDataFromFederationProviderToKeycloak fired for realm=%s -- running full membership sweep.", realm.getName());
+
+        List<ComponentModel> scimTargets = realm.getComponentsStream()
+                .filter(c -> ScimTargetProviderFactory.ID.equals(c.getProviderId()))
+                .toList();
+
+        if (scimTargets.isEmpty()) {
+            debug("No SCIM outbound targets configured in realm=%s. Skipping full sweep.", realm.getName());
+            return new SynchronizationResult();
+        }
+
+        int usersChecked = 0;
+        List<UserModel> allUsers = session.users().searchForUserStream(realm, Map.of()).toList();
+        for (UserModel user : allUsers) {
+            usersChecked++;
+            checkAndUpdateMembership(realm, user);
+        }
+
+        info("Full membership sweep done for realm=%s: usersChecked=%d", realm.getName(), usersChecked);
         return new SynchronizationResult();
     }
 
