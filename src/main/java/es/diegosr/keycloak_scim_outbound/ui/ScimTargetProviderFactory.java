@@ -10,6 +10,7 @@ import org.keycloak.models.RealmModel;
 import org.keycloak.models.utils.KeycloakModelUtils;
 import org.keycloak.provider.ProviderConfigProperty;
 import org.keycloak.storage.UserStorageProviderFactory;
+import org.keycloak.storage.UserStorageProviderModel;
 import org.keycloak.storage.user.ImportSynchronization;
 import org.keycloak.storage.user.SynchronizationResult;
 
@@ -129,17 +130,20 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
         return PROPS;
     }
 
-    /* ===== ImportSynchronization: triggered by the "Synchronize" buttons in the admin console ===== */
+    /* ===== ImportSynchronization: triggered by the "Synchronize" buttons in the admin console =====
+     * NOTE: Keycloak's ImportSynchronization interface takes UserStorageProviderModel (not the
+     * plain ComponentModel) as the last parameter -- see org.keycloak.storage.user.ImportSynchronization
+     * in keycloak-server-spi-private for the exact signature. */
 
     @Override
-    public SynchronizationResult sync(KeycloakSessionFactory sessionFactory, String realmId, ComponentModel model) {
+    public SynchronizationResult sync(KeycloakSessionFactory sessionFactory, String realmId, UserStorageProviderModel model) {
         info("Manual 'Synchronize all users' triggered for target=%s (componentId=%s) realm=%s",
                 model.getName(), model.getId(), realmId);
         return runSweep(sessionFactory, realmId, model);
     }
 
     @Override
-    public SynchronizationResult syncSince(Date lastSync, KeycloakSessionFactory sessionFactory, String realmId, ComponentModel model) {
+    public SynchronizationResult syncSince(Date lastSync, KeycloakSessionFactory sessionFactory, String realmId, UserStorageProviderModel model) {
         info("Manual 'Synchronize changed users' triggered for target=%s (componentId=%s) realm=%s lastSync=%s",
                 model.getName(), model.getId(), realmId, lastSync);
         // We don't have an incremental changed-users query for our own attribute state,
