@@ -1,23 +1,36 @@
 package es.diegosr.keycloak_scim_outbound.ui;
 
+import es.diegosr.keycloak_scim_outbound.ldapsync.ScimMembershipSync;
+
 import org.keycloak.component.ComponentModel;
 import org.keycloak.component.ComponentValidationException;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.KeycloakSessionFactory;
 import org.keycloak.models.RealmModel;
+import org.keycloak.models.utils.KeycloakModelUtils;
 import org.keycloak.provider.ProviderConfigProperty;
 import org.keycloak.storage.UserStorageProviderFactory;
+import org.keycloak.storage.user.ImportSynchronization;
+import org.keycloak.storage.user.SynchronizationResult;
 
+import java.util.Date;
 import java.util.List;
 
 /**
- * UI-configurable provider (shows up under: Realm → User Federation → Add provider).
+ * UI-configurable provider (shows up under: Realm -> User Federation -> Add provider).
  * This does not store users; it only holds SCIM target configuration so the event listener
  * can read it and push SCIM operations accordingly.
+ *
+ * Implements ImportSynchronization so that clicking "Synchronize all users" /
+ * "Synchronize changed users" on this provider's page in the admin console triggers
+ * an immediate sweep of pending LDAP-driven membership changes for THIS target only,
+ * instead of waiting for the next 5-minute timer tick.
  */
-public class ScimTargetProviderFactory implements UserStorageProviderFactory<ScimTargetProvider> {
+public class ScimTargetProviderFactory implements UserStorageProviderFactory<ScimTargetProvider>, ImportSynchronization {
 
-    /** Stable provider id shown in the “Add provider” list. Keep this in sync with the listener lookup. */
+    private static final String LOG_TAG = "[keycloak-scim-outbound/MANUAL-SYNC]";
+
+    /** Stable provider id shown in the "Add provider" list. Keep this in sync with the listener lookup. */
     public static final String ID = "keycloak-scim-outbound";
 
     /** Config keys stored in ComponentModel#getConfig(). */
@@ -116,6 +129,46 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
         return PROPS;
     }
 
+    /* ===== ImportSynchronization: triggered by the "Synchronize" buttons in the admin console ===== */
+
+    @Override
+    public SynchronizationResult sync(KeycloakSessionFactory sessionFactory, String realmId, ComponentModel model) {
+        info("Manual 'Synchronize all users' triggered for target=%s (componentId=%s) realm=%s",
+                model.getName(), model.getId(), realmId);
+        return runSweep(sessionFactory, realmId, model);
+    }
+
+    @Override
+    public SynchronizationResult syncSince(Date lastSync, KeycloakSessionFactory sessionFactory, String realmId, ComponentModel model) {
+        info("Manual 'Synchronize changed users' triggered for target=%s (componentId=%s) realm=%s lastSync=%s",
+                model.getName(), model.getId(), realmId, lastSync);
+        // We don't have an incremental changed-users query for our own attribute state,
+        // so we just run the same full pending-entries sweep, scoped to this component.
+        return runSweep(sessionFactory, realmId, model);
+    }
+
+    private SynchronizationResult runSweep(KeycloakSessionFactory sessionFactory, String realmId, ComponentModel model) {
+        long start = System.currentTimeMillis();
+        try {
+            KeycloakModelUtils.runJobInTransaction(sessionFactory, session -> {
+                RealmModel realm = session.realms().getRealm(realmId);
+                if (realm == null) {
+                    err("Realm not found for realmId=%s during manual sync of target=%s", realmId, model.getName());
+                    return;
+                }
+                ScimMembershipSync.processPendingMembershipChanges(session, realm, model.getId());
+            });
+            info("Manual sync for target=%s completed in %dms", model.getName(), System.currentTimeMillis() - start);
+        } catch (Exception e) {
+            err("Manual sync for target=%s FAILED: %s", model.getName(), e.getMessage());
+            SynchronizationResult failed = new SynchronizationResult();
+            failed.setFailed(1);
+            return failed;
+        }
+        SynchronizationResult result = new SynchronizationResult();
+        return result;
+    }
+
     /* ===== Helpers ===== */
 
     private static ProviderConfigProperty prop(String type, String name, String help,
@@ -142,5 +195,19 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
     public static String get(ComponentModel m, String key, String def) {
         String v = m.getConfig().getFirst(key);
         return v != null ? v : def;
+    }
+
+    /* ===== logging ===== */
+
+    private static String now() {
+        return java.time.OffsetDateTime.now().toString();
+    }
+
+    private static void info(String fmt, Object... args) {
+        System.out.printf("%s %s INFO  %s%n", now(), LOG_TAG, String.format(fmt, args));
+    }
+
+    private static void err(String fmt, Object... args) {
+        System.err.printf("%s %s ERROR %s%n", now(), LOG_TAG, String.format(fmt, args));
     }
 }
