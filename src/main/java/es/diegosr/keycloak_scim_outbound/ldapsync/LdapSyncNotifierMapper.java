@@ -146,12 +146,18 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
 
     @Override
     public List<UserModel> getRoleMembers(RealmModel realm, org.keycloak.models.RoleModel role, int firstResult, int maxResults) {
-        return null;
+        // Must return an empty list, never null: Keycloak's LDAP federation layer
+        // aggregates getRoleMembers()/getGroupMembers() results across ALL mappers
+        // registered on the provider. Returning null here breaks that aggregation
+        // and can wipe out group/role member listings contributed by other mappers
+        // (e.g. the built-in group-ldap-mapper) once this mapper is added to the chain.
+        return java.util.Collections.emptyList();
     }
 
     @Override
     public List<UserModel> getGroupMembers(RealmModel realm, GroupModel group, int firstResult, int maxResults) {
-        return null;
+        // See note on getRoleMembers() above -- never return null here.
+        return java.util.Collections.emptyList();
     }
 
     @Override
