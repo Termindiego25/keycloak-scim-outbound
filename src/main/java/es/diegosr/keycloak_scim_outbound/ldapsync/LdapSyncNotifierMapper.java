@@ -16,6 +16,7 @@ import org.keycloak.storage.user.SynchronizationResult;
 
 import javax.naming.AuthenticationException;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -35,12 +36,30 @@ import java.util.Optional;
  *     ONLY when the group-ldap-mapper is running in IMPORT mode (membership gets
  *     written into Keycloak's local user/group tables during per-user import).
  *
- *   - syncDataFromFederationProviderToKeycloak(...): fires once per full LDAP sync run.
- *     This is the ONLY reliable hook when group-ldap-mapper is in LDAP_ONLY (or
- *     READ_ONLY) mode, because in that mode membership is computed live from LDAP via
- *     user.getGroupsStream() and never routed through the per-user import callback.
- *     We use this hook to iterate all local users ourselves and re-run the same
- *     membership diff logic.
+ *   - syncDataFromFederationProviderToKeycloak(...): fires once per full LDAP sync run
+ *     (including "changed users" delta syncs -- Keycloak calls every registered
+ *     LDAPStorageMapper's syncDataFromFederationProviderToKeycloak on EVERY sync,
+ *     regardless of delta/full). This is the ONLY reliable hook when group-ldap-mapper
+ *     is in LDAP_ONLY (or READ_ONLY) mode, because in that mode membership is computed
+ *     live from LDAP via user.getGroupsStream() and never routed through the per-user
+ *     import callback.
+ *
+ *     IMPORTANT (perf): this hook must NOT iterate every user in the realm on every
+ *     sync -- with hundreds/thousands of users that makes every LDAP sync (including
+ *     frequent delta syncs) extremely slow. Instead we build a small, targeted
+ *     candidate set (see buildCandidateUsers below) using indexed/scoped lookups:
+ *       1. users CURRENTLY in one of the configured filter groups (via the built-in
+ *          group-ldap-mapper's own group-scoped getGroupMembersStream(...) query --
+ *          an LDAP search filtered to just that group, not a realm-wide user scan),
+ *       2. users with an outstanding pending flag (indexed attribute search on
+ *          MembershipState.PENDING_ATTRIBUTE_NAME),
+ *       3. users we last recorded as an active/SENT member of a target (indexed
+ *          attribute search on MembershipState.ATTRIBUTE_NAME for the exact
+ *          "<componentId>:<groupName>:SENT" value) -- this is what lets us detect a
+ *          user who just LEFT the group, since they will no longer appear in (1).
+ *     The union of these three sets is exactly the population that can possibly need a
+ *     membership-state transition; everyone else is provably unchanged since the last
+ *     sync and does not need to be touched.
  *
  * IMPORTANT: this mapper must be ordered AFTER the built-in "group-ldap-mapper" in the
  * LDAP provider's Mappers list, so that user.getGroupsStream() already reflects the
@@ -59,14 +78,6 @@ import java.util.Optional;
  * nothing to do with LDAP, so we must bypass that read-only delegate and write them
  * directly on Keycloak's LOCAL user storage instead, via
  * UserStoragePrivateUtil.userLocalStorage(session).
- *
- * PENDING WORK-QUEUE ATTRIBUTE: alongside MembershipState.ATTRIBUTE_NAME (the full
- * per-target diff state), this mapper also maintains MembershipState.PENDING_ATTRIBUTE_NAME
- * -- a lightweight multi-valued attribute containing "<componentId>:1" for every SCIM
- * target that currently has an un-SENT (NEW_ADDED/NEW_DELETED) entry for this user.
- * ScimMembershipSync uses an indexed searchForUserByUserAttributeStream(...) lookup on
- * this attribute to find only the users it needs to process, instead of scanning every
- * user in the realm on every sync cycle.
  */
 public class LdapSyncNotifierMapper implements LDAPStorageMapper {
 
@@ -89,7 +100,7 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
     /**
      * Re-checks group membership for a single user against all configured SCIM targets
      * and updates the tracking attributes if anything changed. Shared by both
-     * onImportUserFromLDAP (IMPORT mode) and the full-sync sweep below (LDAP_ONLY mode).
+     * onImportUserFromLDAP (IMPORT mode) and the targeted sweep below (LDAP_ONLY mode).
      */
     private void checkAndUpdateMembership(RealmModel realm, UserModel user) {
         List<ComponentModel> scimTargets = realm.getComponentsStream()
@@ -250,31 +261,88 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
 
     @Override
     public SynchronizationResult syncDataFromFederationProviderToKeycloak(RealmModel realm) {
+        // Keycloak invokes this on EVERY LDAP sync run for EVERY registered mapper --
+        // including frequent delta ("changed users") syncs -- so it must stay cheap.
         // In LDAP_ONLY (or READ_ONLY) mode, the built-in group-ldap-mapper computes
         // group membership live from LDAP and does NOT route changes through
-        // onImportUserFromLDAP. This is the only reliable hook we get for a full sync
-        // in that mode, so we iterate all local users here and re-run the same
-        // membership diff logic used in onImportUserFromLDAP.
-        info("syncDataFromFederationProviderToKeycloak fired for realm=%s -- running full membership sweep.", realm.getName());
-
+        // onImportUserFromLDAP, so this is our only reliable hook in that mode. But we
+        // must NOT iterate every user in the realm here (that was the original
+        // performance problem, e.g. 941 users scanned on every single sync). Instead we
+        // build a small targeted candidate set -- see buildCandidateUsers() -- and only
+        // re-run the membership diff for those users.
         List<ComponentModel> scimTargets = realm.getComponentsStream()
                 .filter(c -> ScimTargetProviderFactory.ID.equals(c.getProviderId()))
                 .toList();
 
         if (scimTargets.isEmpty()) {
-            debug("No SCIM outbound targets configured in realm=%s. Skipping full sweep.", realm.getName());
+            debug("No SCIM outbound targets configured in realm=%s. Skipping sweep.", realm.getName());
             return new SynchronizationResult();
         }
 
+        Map<String, UserModel> candidates = buildCandidateUsers(realm, scimTargets);
+
+        info("syncDataFromFederationProviderToKeycloak fired for realm=%s -- checking %d targeted candidate(s) instead of full realm scan.",
+                realm.getName(), candidates.size());
+
         int usersChecked = 0;
-        List<UserModel> allUsers = session.users().searchForUserStream(realm, Map.of()).toList();
-        for (UserModel user : allUsers) {
+        for (UserModel user : candidates.values()) {
             usersChecked++;
             checkAndUpdateMembership(realm, user);
         }
 
-        info("Full membership sweep done for realm=%s: usersChecked=%d", realm.getName(), usersChecked);
+        info("Targeted membership check done for realm=%s: usersChecked=%d", realm.getName(), usersChecked);
         return new SynchronizationResult();
+    }
+
+    /**
+     * Builds the set of users that could possibly need a membership-state transition,
+     * without ever enumerating every user in the realm:
+     *
+     *   1. Users CURRENTLY in one of the configured filter groups. Looked up via
+     *      session.users().getGroupMembersStream(realm, group), which for an
+     *      LDAP-federated group delegates to the built-in group-ldap-mapper's own
+     *      group-scoped LDAP query (filtered to just that group's members) rather than
+     *      a realm-wide scan. Catches new joins.
+     *
+     *   2. Users with an outstanding pending flag for any target (indexed attribute
+     *      search on MembershipState.PENDING_ATTRIBUTE_NAME). Catches users whose last
+     *      known transition (NEW_ADDED/NEW_DELETED) has not yet been confirmed/re-synced.
+     *
+     *   3. Users we last recorded as an active/SENT member of a target (indexed
+     *      attribute search on MembershipState.ATTRIBUTE_NAME for the exact
+     *      "<componentId>:<groupName>:SENT" value). This is what lets us detect a user
+     *      who just LEFT the group: they will no longer show up in (1), but we still
+     *      need to re-check them so their state can flip to NEW_DELETED.
+     *
+     * The union of (1) + (2) + (3) is exactly the population that can possibly have
+     * changed since the last sync; everyone else is provably unchanged.
+     */
+    private Map<String, UserModel> buildCandidateUsers(RealmModel realm, List<ComponentModel> scimTargets) {
+        Map<String, UserModel> candidates = new LinkedHashMap<>();
+
+        for (ComponentModel target : scimTargets) {
+            String groupName = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
+            if (groupName == null || groupName.isBlank()) {
+                continue;
+            }
+
+            // (1) currently in the group -- group-scoped lookup, not a realm-wide scan.
+            session.groups().searchForGroupByNameStream(realm, groupName, true, null, null)
+                    .forEach(group -> session.users().getGroupMembersStream(realm, group)
+                            .forEach(u -> candidates.putIfAbsent(u.getId(), u)));
+
+            // (2) currently pending for this target -- indexed attribute search.
+            session.users().searchForUserByUserAttributeStream(realm, MembershipState.PENDING_ATTRIBUTE_NAME, MembershipState.pendingValue(target.getId()))
+                    .forEach(u -> candidates.putIfAbsent(u.getId(), u));
+
+            // (3) last known as an active (SENT) member of this target -- indexed
+            // attribute search on the exact tracked value, so we can detect departures.
+            String sentValue = new MembershipState(target.getId(), groupName, MembershipState.State.SENT).toValue();
+            session.users().searchForUserByUserAttributeStream(realm, MembershipState.ATTRIBUTE_NAME, sentValue)
+                    .forEach(u -> candidates.putIfAbsent(u.getId(), u));
+        }
+
+        return candidates;
     }
 
     @Override
