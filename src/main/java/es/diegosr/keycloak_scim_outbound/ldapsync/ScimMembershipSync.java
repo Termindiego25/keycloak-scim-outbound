@@ -11,6 +11,7 @@ import org.keycloak.models.UserModel;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -69,7 +70,9 @@ public final class ScimMembershipSync {
         int pushedRemoves = 0;
         int failures = 0;
 
-        List<UserModel> allUsers = session.users().getUsersStream(realm).toList();
+        // NOTE: UserProvider#getUsersStream(RealmModel) was removed in this Keycloak version.
+        // Use searchForUserStream(RealmModel, Map) with an empty params map to fetch all users instead.
+        List<UserModel> allUsers = session.users().searchForUserStream(realm, Map.of()).toList();
         debug("Scanning %d user(s) in realm=%s for pending entries...", allUsers.size(), realm.getName());
 
         for (UserModel user : allUsers) {
