@@ -54,10 +54,19 @@ import java.util.Optional;
  * ReadonlyLDAPUserModelDelegate during sync), calling setAttribute(...) directly on the
  * UserModel passed in by the LDAP sync machinery throws
  * org.keycloak.storage.ReadOnlyException: "Federated storage is not writable". Our
- * tracking attribute (MembershipState.ATTRIBUTE_NAME) is a purely local bookkeeping
- * value that has nothing to do with LDAP, so we must bypass that read-only delegate
- * and write it directly on Keycloak's LOCAL user storage instead, via
+ * tracking attributes (MembershipState.ATTRIBUTE_NAME and
+ * MembershipState.PENDING_ATTRIBUTE_NAME) are purely local bookkeeping values that have
+ * nothing to do with LDAP, so we must bypass that read-only delegate and write them
+ * directly on Keycloak's LOCAL user storage instead, via
  * UserStoragePrivateUtil.userLocalStorage(session).
+ *
+ * PENDING WORK-QUEUE ATTRIBUTE: alongside MembershipState.ATTRIBUTE_NAME (the full
+ * per-target diff state), this mapper also maintains MembershipState.PENDING_ATTRIBUTE_NAME
+ * -- a lightweight multi-valued attribute containing "<componentId>:1" for every SCIM
+ * target that currently has an un-SENT (NEW_ADDED/NEW_DELETED) entry for this user.
+ * ScimMembershipSync uses an indexed searchForUserByUserAttributeStream(...) lookup on
+ * this attribute to find only the users it needs to process, instead of scanning every
+ * user in the realm on every sync cycle.
  */
 public class LdapSyncNotifierMapper implements LDAPStorageMapper {
 
@@ -79,7 +88,7 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
 
     /**
      * Re-checks group membership for a single user against all configured SCIM targets
-     * and updates the tracking attribute if anything changed. Shared by both
+     * and updates the tracking attributes if anything changed. Shared by both
      * onImportUserFromLDAP (IMPORT mode) and the full-sync sweep below (LDAP_ONLY mode).
      */
     private void checkAndUpdateMembership(RealmModel realm, UserModel user) {
@@ -133,23 +142,40 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
         }
 
         if (changed) {
-            persistTrackingAttribute(realm, user, currentValues);
+            List<String> pendingValues = computePendingValues(currentValues, scimTargets);
+            persistTrackingAttributes(realm, user, currentValues, pendingValues);
         } else {
             debug("No attribute changes for user=%s.", user.getUsername());
         }
     }
 
     /**
-     * Writes MembershipState.ATTRIBUTE_NAME on Keycloak's LOCAL user storage, bypassing
-     * whatever read-only/federated UserModel delegate the LDAP sync machinery handed us.
-     * This is required because during LDAP sync (especially with edit mode READ_ONLY,
-     * or when the built-in group-ldap-mapper wraps the user), calling setAttribute(...)
-     * directly on the passed-in UserModel throws
-     * org.keycloak.storage.ReadOnlyException: "Federated storage is not writable" --
-     * even though our attribute is purely local bookkeeping and has nothing to do with
-     * the LDAP-mapped fields.
+     * Derives the pending work-queue values from the full membership-state list: one
+     * "<componentId>:1" entry for every SCIM target that currently has an un-SENT
+     * (NEW_ADDED or NEW_DELETED) entry for this user.
      */
-    private void persistTrackingAttribute(RealmModel realm, UserModel user, List<String> values) {
+    private List<String> computePendingValues(List<String> stateValues, List<ComponentModel> scimTargets) {
+        List<String> pending = new ArrayList<>();
+        for (ComponentModel target : scimTargets) {
+            Optional<MembershipState> state = MembershipState.findForComponent(stateValues, target.getId());
+            if (state.isPresent() && state.get().state() != MembershipState.State.SENT) {
+                pending.add(MembershipState.pendingValue(target.getId()));
+            }
+        }
+        return pending;
+    }
+
+    /**
+     * Writes MembershipState.ATTRIBUTE_NAME and MembershipState.PENDING_ATTRIBUTE_NAME on
+     * Keycloak's LOCAL user storage, bypassing whatever read-only/federated UserModel
+     * delegate the LDAP sync machinery handed us. This is required because during LDAP
+     * sync (especially with edit mode READ_ONLY, or when the built-in group-ldap-mapper
+     * wraps the user), calling setAttribute(...) directly on the passed-in UserModel
+     * throws org.keycloak.storage.ReadOnlyException: "Federated storage is not writable"
+     * -- even though our attributes are purely local bookkeeping and have nothing to do
+     * with the LDAP-mapped fields.
+     */
+    private void persistTrackingAttributes(RealmModel realm, UserModel user, List<String> stateValues, List<String> pendingValues) {
         UserModel localUser = UserStoragePrivateUtil.userLocalStorage(session).getUserById(realm, user.getId());
 
         if (localUser == null) {
@@ -159,15 +185,17 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
             // read-only this will throw, and we at least log why.
             info("Could not resolve local storage user for id=%s (username=%s); attempting direct setAttribute as fallback.",
                     user.getId(), user.getUsername());
-            user.setAttribute(MembershipState.ATTRIBUTE_NAME, values);
-            info("Persisted attribute '%s' for user=%s -> %s (via federated delegate fallback)",
-                    MembershipState.ATTRIBUTE_NAME, user.getUsername(), values);
+            user.setAttribute(MembershipState.ATTRIBUTE_NAME, stateValues);
+            user.setAttribute(MembershipState.PENDING_ATTRIBUTE_NAME, pendingValues);
+            info("Persisted attributes '%s'=%s and '%s'=%s for user=%s (via federated delegate fallback)",
+                    MembershipState.ATTRIBUTE_NAME, stateValues, MembershipState.PENDING_ATTRIBUTE_NAME, pendingValues, user.getUsername());
             return;
         }
 
-        localUser.setAttribute(MembershipState.ATTRIBUTE_NAME, values);
-        info("Persisted attribute '%s' for user=%s -> %s (via local storage)",
-                MembershipState.ATTRIBUTE_NAME, user.getUsername(), values);
+        localUser.setAttribute(MembershipState.ATTRIBUTE_NAME, stateValues);
+        localUser.setAttribute(MembershipState.PENDING_ATTRIBUTE_NAME, pendingValues);
+        info("Persisted attributes '%s'=%s and '%s'=%s for user=%s (via local storage)",
+                MembershipState.ATTRIBUTE_NAME, stateValues, MembershipState.PENDING_ATTRIBUTE_NAME, pendingValues, user.getUsername());
     }
 
     /* ===== Required LDAPStorageMapper methods (no-ops, this mapper only observes) ===== */
