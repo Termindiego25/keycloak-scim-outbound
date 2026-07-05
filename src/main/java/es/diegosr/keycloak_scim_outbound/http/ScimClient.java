@@ -201,6 +201,9 @@ public class ScimClient {
 
     /**
      * Shared filter-based id lookup for both /Users and /Groups.
+     * If the server ignores the filter and returns more than one result,
+     * returns Optional.empty() so the caller can fall back to a different lookup
+     * (e.g. displayName for groups, userName for users).
      */
     private Optional<String> findEntityIdByFilter(String resource, String attribute, String value, String operation) {
         if (value == null || value.isBlank()) return Optional.empty();
@@ -212,6 +215,12 @@ public class ScimClient {
             if (is2xx(res.statusCode())) {
                 ScimListResponse r = parseListResponse(res.body());
                 httpInfo("GET /%s?%s -> %d totalResults=%d", resource, query, res.statusCode(), r.totalResults());
+                if (r.totalResults() > 1) {
+                    // Server returned multiple results: the filter was ignored.
+                    // Return empty so the caller falls back to its next lookup strategy.
+                    httpInfo("GET /%s?%s: totalResults=%d > 1 suggests filter was ignored; returning empty to trigger fallback", resource, query, r.totalResults());
+                    return Optional.empty();
+                }
                 if (r.firstId().isPresent()) return r.firstId();
                 if (r.totalResults() > 0 || r.resourcesPresent()) {
                     httpErr("Could not extract id from SCIM response for %s (Resources present but no id found).", resource);
