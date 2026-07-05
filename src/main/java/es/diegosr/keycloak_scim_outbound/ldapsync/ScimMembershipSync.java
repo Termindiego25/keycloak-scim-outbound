@@ -2,53 +2,46 @@ package es.diegosr.keycloak_scim_outbound.ldapsync;
 
 import es.diegosr.keycloak_scim_outbound.http.ScimClient;
 import es.diegosr.keycloak_scim_outbound.ui.ScimTargetProviderFactory;
+import es.diegosr.keycloak_scim_outbound.util.ScimGroupMapper;
 import es.diegosr.keycloak_scim_outbound.util.ScimMapper;
 
 import org.keycloak.component.ComponentModel;
+import org.keycloak.models.GroupModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
-import es.diegosr.keycloak_scim_outbound.ldapsync.GroupSyncState;
-import es.diegosr.keycloak_scim_outbound.util.ScimGroupMapper;
-
-import org.keycloak.models.GroupModel;
 import org.keycloak.storage.UserStoragePrivateUtil;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 /**
- * Consumes the state written by LdapSyncNotifierMapper (the
- * "ldapSyncNotifier.filterGroupMembership" attribute) and pushes pending
- * membership changes to the relevant SCIM target(s).
+ * Handles two distinct sync modes for SCIM outbound provisioning:
  *
- * Invoked from two places:
- *   1. A 5-minute TimerProvider task (ScimEventListenerProviderFactory#postInit),
- *      scanning ALL SCIM targets in ALL realms.
- *   2. ScimTargetProviderFactory#sync / #syncSince (ImportSynchronization), triggered when
- *      an admin clicks "Synchronize all users" / "Synchronize changed users" on a
- *      specific SCIM outbound federation provider in the console -- scoped to just
- *      that one componentId.
+ * 1. processPendingMembershipChanges() -- "changed users" sweep.
+ *    Consumes the state written by LdapSyncNotifierMapper
+ *    (MembershipState.PENDING_ATTRIBUTE_NAME) and pushes only users/groups that are
+ *    flagged as changed since the last LDAP sync. Called by:
+ *      - ScimTargetProviderFactory#syncSince (Keycloak "Synchronize changed users" button /
+ *        Periodic Changed Users Sync scheduler)
  *
- * PERFORMANCE: this used to do a full user-stream scan per tick
- * (session.users().searchForUserStream(realm, Map.of())) to find users with a pending
- * entry in MembershipState.ATTRIBUTE_NAME -- an O(total realm users) operation on every
- * single sync cycle regardless of how many memberships actually changed (e.g. 941 users
- * scanned every run). It now uses the lightweight indexed attribute
- * MembershipState.PENDING_ATTRIBUTE_NAME (values "<componentId>:1", maintained by
- * LdapSyncNotifierMapper) and looks candidates up per-target via
- * searchForUserByUserAttributeStream(realm, PENDING_ATTRIBUTE_NAME, "<componentId>:1"),
- * which is an indexed local-storage lookup, not a full scan. Only users actually
- * flagged pending for a given target are loaded and processed.
+ * 2. fullSync() -- unconditional full reconciliation.
+ *    Upserts every in-scope user and group regardless of pending flags.
+ *    Optionally queries GET /Users and GET /Groups to deprovision stale SCIM entries
+ *    (CFG_RECONCILE_USERS / CFG_RECONCILE_GROUPS). Called by:
+ *      - ScimTargetProviderFactory#sync (Keycloak "Synchronize all users" button /
+ *        Periodic Full Sync scheduler)
  *
- * NOTE: the lookup above is always run against UserStoragePrivateUtil.userLocalStorage(session),
- * never the aggregated session.users(). PENDING_ATTRIBUTE_NAME is a local bookkeeping
- * attribute with no meaning to any federated provider; searching it through the
- * aggregated view causes federated providers (e.g. the LDAP provider) to push the
- * attribute into their own native query, which fails for attributes they don't recognize.
+ * PERFORMANCE NOTE: the pending sweep uses an indexed attribute lookup via
+ * UserStoragePrivateUtil.userLocalStorage(session) -- never the aggregated session.users().
+ * MembershipState.PENDING_ATTRIBUTE_NAME is a local bookkeeping attribute; searching it
+ * through the aggregated view causes the LDAP provider to push it into a raw LDAP filter
+ * which AD rejects with InvalidSearchFilterException.
  */
 public final class ScimMembershipSync {
 
@@ -56,11 +49,181 @@ public final class ScimMembershipSync {
 
     private ScimMembershipSync() { }
 
+    // =========================================================================
+    // Full sync
+    // =========================================================================
+
+    /**
+     * Performs a full unconditional sync for the given SCIM target:
+     *   1. Resolves the in-scope user set (all members of filterGroup, or all realm users).
+     *   2. Upserts every in-scope user via SCIM /Users (POST or PATCH).
+     *   3. If CFG_RECONCILE_USERS=true: queries GET /Users, deprovisions any SCIM user
+     *      whose externalId is not in the in-scope set using the configured deprovisionAction.
+     *   4. If CFG_PROVISION_GROUPS=true: upserts every in-scope group via SCIM /Groups.
+     *   5. If CFG_RECONCILE_GROUPS=true: queries GET /Groups, deletes any SCIM group
+     *      whose externalId is not in the in-scope Keycloak group set.
+     *
+     * @param componentIdFilter the componentId of the specific SCIM target to sync.
+     * @return int[2]: [usersUpserted, failures]
+     */
+    public static int[] fullSync(KeycloakSession session, RealmModel realm, String componentIdFilter) {
+        long start = System.currentTimeMillis();
+        info("=== fullSync START realm=%s componentId=%s ===", realm.getName(), componentIdFilter);
+
+        List<ComponentModel> targets = realm.getComponentsStream()
+                .filter(c -> ScimTargetProviderFactory.ID.equals(c.getProviderId()))
+                .filter(c -> componentIdFilter == null || componentIdFilter.equals(c.getId()))
+                .toList();
+
+        if (targets.isEmpty()) {
+            debug("fullSync: no matching SCIM targets in realm=%s. Nothing to do.", realm.getName());
+            return new int[]{0, 0};
+        }
+
+        int totalUpserted = 0;
+        int totalFailures = 0;
+
+        for (ComponentModel target : targets) {
+            String base  = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_BASE_URL, null);
+            String token = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_TOKEN, null);
+            if (base == null || token == null) {
+                err("fullSync: target=%s incomplete configuration (baseUrl/token). Skipping.", target.getName());
+                totalFailures++;
+                continue;
+            }
+            ScimClient client = new ScimClient(base, token);
+
+            // -- Resolve in-scope users --
+            List<UserModel> inScopeUsers = resolveInScopeUsers(session, realm, target);
+            Set<String> inScopeExternalIds = new HashSet<>();
+            info("fullSync: target=%s in-scope user count=%d", target.getName(), inScopeUsers.size());
+
+            // -- Upsert each in-scope user --
+            for (UserModel user : inScopeUsers) {
+                inScopeExternalIds.add(user.getId());
+                String scimUserName = computeScimUserName(target, user);
+                if (scimUserName == null || scimUserName.isBlank()) {
+                    err("fullSync: cannot resolve SCIM userName for user=%s target=%s. Skipping.",
+                            user.getUsername(), target.getName());
+                    totalFailures++;
+                    continue;
+                }
+                try {
+                    boolean ok = upsertUser(client, user, scimUserName);
+                    if (ok) {
+                        totalUpserted++;
+                        debug("fullSync: UPSERT OK user=%s target=%s", user.getUsername(), target.getName());
+                    } else {
+                        totalFailures++;
+                        err("fullSync: UPSERT FAILED user=%s target=%s", user.getUsername(), target.getName());
+                    }
+                } catch (Exception e) {
+                    totalFailures++;
+                    err("fullSync: EXCEPTION upserting user=%s target=%s: %s",
+                            user.getUsername(), target.getName(), e.getMessage());
+                }
+            }
+
+            // -- Reconcile stale SCIM users (optional) --
+            boolean reconcileUsers = Boolean.parseBoolean(
+                    ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_RECONCILE_USERS, "false"));
+            if (reconcileUsers) {
+                info("fullSync: reconciling /Users for target=%s (querying SCIM)", target.getName());
+                Map<String, String> scimUsers = client.listAllUserExternalIds(); // scimId -> externalId
+                for (Map.Entry<String, String> entry : scimUsers.entrySet()) {
+                    String scimId     = entry.getKey();
+                    String externalId = entry.getValue();
+                    if (!inScopeExternalIds.contains(externalId)) {
+                        info("fullSync: RECONCILE deprovision scimId=%s externalId=%s target=%s",
+                                scimId, externalId, target.getName());
+                        try {
+                            boolean ok = deprovisionUserById(target, client, scimId);
+                            if (!ok) {
+                                totalFailures++;
+                                err("fullSync: RECONCILE deprovision FAILED scimId=%s target=%s", scimId, target.getName());
+                            }
+                        } catch (Exception e) {
+                            totalFailures++;
+                            err("fullSync: RECONCILE deprovision EXCEPTION scimId=%s target=%s: %s",
+                                    scimId, target.getName(), e.getMessage());
+                        }
+                    }
+                }
+            }
+
+            // -- Group provisioning --
+            if (!isGroupProvisioningEnabled(target)) continue;
+
+            List<GroupModel> inScopeGroups = resolveInScopeGroups(session, realm, target);
+            Set<String> inScopeGroupExternalIds = new HashSet<>();
+            info("fullSync: target=%s in-scope group count=%d", target.getName(), inScopeGroups.size());
+
+            for (GroupModel group : inScopeGroups) {
+                inScopeGroupExternalIds.add(group.getId());
+                try {
+                    boolean ok = upsertScimGroup(client, group, target, session, realm);
+                    if (ok) {
+                        // Update local state to SYNCED so the pending sweep skips this group
+                        group.setAttribute(GroupSyncState.STATE_ATTR_PREFIX + target.getId() + ".name",
+                                List.of(group.getName()));
+                        GroupSyncState.clearState(group, target.getId());
+                        group.setAttribute(GroupSyncState.STATE_ATTR_PREFIX + target.getId(),
+                                List.of(GroupSyncState.State.SYNCED.name()));
+                        GroupSyncState.removePendingFlag(group, target.getId());
+                        info("fullSync: GROUP UPSERT OK group='%s' target=%s", group.getName(), target.getName());
+                    } else {
+                        totalFailures++;
+                        err("fullSync: GROUP UPSERT FAILED group='%s' target=%s", group.getName(), target.getName());
+                    }
+                } catch (Exception e) {
+                    totalFailures++;
+                    err("fullSync: GROUP UPSERT EXCEPTION group='%s' target=%s: %s",
+                            group.getName(), target.getName(), e.getMessage());
+                }
+            }
+
+            // -- Reconcile stale SCIM groups (optional) --
+            boolean reconcileGroups = Boolean.parseBoolean(
+                    ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_RECONCILE_GROUPS, "false"));
+            if (reconcileGroups) {
+                info("fullSync: reconciling /Groups for target=%s (querying SCIM)", target.getName());
+                Map<String, String> scimGroups = client.listAllGroupExternalIds(); // scimId -> externalId
+                for (Map.Entry<String, String> entry : scimGroups.entrySet()) {
+                    String scimId     = entry.getKey();
+                    String externalId = entry.getValue();
+                    if (!inScopeGroupExternalIds.contains(externalId)) {
+                        info("fullSync: RECONCILE delete scimGroupId=%s externalId=%s target=%s",
+                                scimId, externalId, target.getName());
+                        try {
+                            boolean ok = client.deleteGroup(scimId);
+                            if (!ok) {
+                                totalFailures++;
+                                err("fullSync: RECONCILE group delete FAILED scimId=%s target=%s", scimId, target.getName());
+                            }
+                        } catch (Exception e) {
+                            totalFailures++;
+                            err("fullSync: RECONCILE group delete EXCEPTION scimId=%s target=%s: %s",
+                                    scimId, target.getName(), e.getMessage());
+                        }
+                    }
+                }
+            }
+        }
+
+        info("=== fullSync DONE realm=%s componentId=%s: upserted=%d failures=%d durationMs=%d ===",
+                realm.getName(), componentIdFilter, totalUpserted, totalFailures,
+                System.currentTimeMillis() - start);
+        return new int[]{totalUpserted, totalFailures};
+    }
+
+    // =========================================================================
+    // Changed-users (pending) sweep
+    // =========================================================================
+
     /**
      * @param componentIdFilter if non-null, only process pending entries for this SCIM
-     *                          target's componentId (used by the manual "Synchronize" trigger).
-     *                          If null, process pending entries for every SCIM target in the realm
-     *                          (used by the periodic timer).
+     *                          target's componentId (used by the "Synchronize changed users"
+     *                          trigger). If null, process all SCIM targets in the realm.
      */
     public static void processPendingMembershipChanges(KeycloakSession session, RealmModel realm, String componentIdFilter) {
         long start = System.currentTimeMillis();
@@ -88,24 +251,17 @@ public final class ScimMembershipSync {
 
         for (ComponentModel target : targets) {
             // Indexed lookup: only users flagged pending for THIS target, instead of
-            // scanning every user in the realm. Replaces the old
-            // session.users().searchForUserStream(realm, Map.of()) full scan.
-            //
-            // Queried against local storage only (not the aggregated session.users()),
-            // since PENDING_ATTRIBUTE_NAME is a local bookkeeping attribute, not an LDAP
-            // schema attribute. Searching it via the aggregated view causes the LDAP
-            // federation provider to push the attribute into a raw LDAP filter sent to
-            // AD, which AD rejects with InvalidSearchFilterException. See
-            // LdapSyncNotifierMapper for the same pattern.
+            // scanning every user in the realm. Always via local storage -- see class Javadoc.
             Map<String, UserModel> candidates = new LinkedHashMap<>();
             UserStoragePrivateUtil.userLocalStorage(session)
-                    .searchForUserByUserAttributeStream(realm, MembershipState.PENDING_ATTRIBUTE_NAME, MembershipState.pendingValue(target.getId()))
+                    .searchForUserByUserAttributeStream(realm, MembershipState.PENDING_ATTRIBUTE_NAME,
+                            MembershipState.pendingValue(target.getId()))
                     .forEach(u -> candidates.putIfAbsent(u.getId(), u));
 
-            debug("Target=%s (id=%s): %d candidate user(s) flagged pending via indexed lookup (no full realm scan).",
+            debug("Target=%s (id=%s): %d candidate user(s) flagged pending via indexed lookup.",
                     target.getName(), target.getId(), candidates.size());
 
-            String base = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_BASE_URL, null);
+            String base  = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_BASE_URL, null);
             String token = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_TOKEN, null);
             if (base == null || token == null) {
                 err("Target=%s incomplete configuration (baseUrl/token). Skipping all pending entries for this target.",
@@ -119,7 +275,6 @@ public final class ScimMembershipSync {
                 usersScanned++;
                 List<String> values = user.getAttributeStream(MembershipState.ATTRIBUTE_NAME).toList();
                 if (values.isEmpty()) {
-                    // Stale pending flag with no backing entry -- clear it defensively.
                     clearPendingFlag(session, realm, user, target.getId());
                     continue;
                 }
@@ -136,12 +291,8 @@ public final class ScimMembershipSync {
                     }
                     MembershipState entry = parsed.get();
 
-                    if (!entry.componentId().equals(target.getId())) {
-                        continue; // entry belongs to a different SCIM target
-                    }
-                    if (entry.state() == MembershipState.State.SENT) {
-                        continue; // already delivered, nothing to do
-                    }
+                    if (!entry.componentId().equals(target.getId())) continue;
+                    if (entry.state() == MembershipState.State.SENT) continue;
 
                     hadPendingForThisUser = true;
                     debug("Pending entry found: user=%s target=%s group='%s' state=%s",
@@ -195,11 +346,6 @@ public final class ScimMembershipSync {
                 if (hadPendingForThisUser) usersWithPending++;
 
                 if (userChanged) {
-                    // Write through local storage: the user object here comes from
-                    // session.users() and may be a federated (e.g. read-only LDAP) view.
-                    // Writing directly to it throws ReadOnlyException when the LDAP
-                    // provider's edit mode is READ_ONLY. See LdapSyncNotifierMapper for
-                    // the same pattern.
                     UserModel localUser = UserStoragePrivateUtil.userLocalStorage(session).getUserById(realm, user.getId());
                     if (localUser != null) {
                         localUser.setAttribute(MembershipState.ATTRIBUTE_NAME, updatedValues);
@@ -210,8 +356,6 @@ public final class ScimMembershipSync {
                     }
                 }
 
-                // Once this user has no more un-SENT entries for THIS target, clear its
-                // pending flag for this target so the next sync's indexed lookup skips it.
                 boolean stillPendingForTarget = updatedValues.stream()
                         .map(MembershipState::parse)
                         .filter(Optional::isPresent)
@@ -230,29 +374,14 @@ public final class ScimMembershipSync {
                 realm.getName(), componentIdFilter == null ? "<all>" : componentIdFilter,
                 usersScanned, usersWithPending, pushedAdds, pushedRemoves, failures, durationMs);
 
-        // Process any pending SCIM group changes (create/update/delete of /Groups resources)
+        // Process any pending SCIM group changes
         processPendingGroupChanges(session, realm, targets);
     }
 
-    /**
-     * For each SCIM target that has group provisioning enabled, iterates groups that have
-     * a pending sync state (NEEDS_SYNC or NEEDS_DELETE in GroupSyncState) and pushes the
-     * corresponding SCIM operation.
-     *
-     * NEEDS_SYNC  -> upsert /Groups (POST if not found, PATCH members+displayName if found).
-     *               Members are resolved by looking up each current Keycloak group member in
-     *               the SCIM /Users endpoint (by externalId, fallback by userName).
-     *               After a successful push the state is set to SYNCED and the synced name
-     *               is recorded in a sibling attribute for rename detection.
-     *
-     * NEEDS_DELETE -> DELETE /Groups/{id} (or skip if already gone from SCIM).
-     *                After a successful push, all state attributes for this target are removed
-     *                from the group.
-     *
-     * Groups are located via GroupSyncState.findPendingGroups(realm), which iterates all
-     * realm groups but checks only those with a non-empty "scim.outbound.pending" attribute.
-     * Group counts are typically small (hundreds at most), so this scan is cheap.
-     */
+    // =========================================================================
+    // Group helpers (shared by both sync modes)
+    // =========================================================================
+
     private static void processPendingGroupChanges(KeycloakSession session, RealmModel realm,
                                                    List<ComponentModel> targets) {
         for (ComponentModel target : targets) {
@@ -270,11 +399,11 @@ public final class ScimMembershipSync {
             debug("Target=%s: %d group(s) with pending flags found.", target.getName(), pendingGroups.size());
 
             for (GroupModel group : pendingGroups) {
-                java.util.Optional<GroupSyncState.State> stateOpt = GroupSyncState.getState(group, target.getId());
-                if (stateOpt.isEmpty()) continue; // no state for this target
+                Optional<GroupSyncState.State> stateOpt = GroupSyncState.getState(group, target.getId());
+                if (stateOpt.isEmpty()) continue;
 
                 GroupSyncState.State state = stateOpt.get();
-                if (state == GroupSyncState.State.SYNCED) continue; // nothing to do
+                if (state == GroupSyncState.State.SYNCED) continue;
 
                 debug("Processing group='%s' state=%s target=%s", group.getName(), state, target.getName());
 
@@ -282,14 +411,11 @@ public final class ScimMembershipSync {
                     if (state == GroupSyncState.State.NEEDS_SYNC) {
                         boolean ok = upsertScimGroup(client, group, target, session, realm);
                         if (ok) {
-                            // Record the synced name for rename detection on next sync
                             group.setAttribute(GroupSyncState.STATE_ATTR_PREFIX + target.getId() + ".name",
-                                    java.util.List.of(group.getName()));
+                                    List.of(group.getName()));
                             GroupSyncState.clearState(group, target.getId());
-                            // Re-set as SYNCED (clearState removed the attribute, we need SYNCED)
                             group.setAttribute(GroupSyncState.STATE_ATTR_PREFIX + target.getId(),
-                                    java.util.List.of(GroupSyncState.State.SYNCED.name()));
-                            // Remove the pending flag (no longer undelivered)
+                                    List.of(GroupSyncState.State.SYNCED.name()));
                             GroupSyncState.removePendingFlag(group, target.getId());
                             info("GROUP SYNC OK group='%s' target=%s", group.getName(), target.getName());
                         } else {
@@ -313,45 +439,29 @@ public final class ScimMembershipSync {
         }
     }
 
-    /**
-     * Upsert a SCIM /Groups resource:
-     *   1. Try to find it by externalId (Keycloak group UUID), then by displayName.
-     *   2. If not found: POST /Groups with all current members resolved.
-     *   3. If found: PATCH to replace displayName and members list.
-     * Returns true if the operation succeeded.
-     */
     private static boolean upsertScimGroup(ScimClient client, GroupModel group,
                                            ComponentModel target, KeycloakSession session, RealmModel realm) {
-        // Resolve current members of the Keycloak group into SCIM user ids
         List<ScimGroupMapper.ScimMemberRef> members = resolveGroupMembers(client, group, target, session, realm);
 
-        // Look up existing SCIM group
-        java.util.Optional<String> scimGroupId = client.findGroupIdByExternalId(group.getId());
+        Optional<String> scimGroupId = client.findGroupIdByExternalId(group.getId());
         if (scimGroupId.isEmpty()) {
             scimGroupId = client.findGroupIdByDisplayName(group.getName());
         }
 
         if (scimGroupId.isEmpty()) {
-            // Create new SCIM group
             boolean created = client.createGroup(ScimGroupMapper.buildCreateGroup(group, members));
             if (created) return true;
-            // 409 conflict: race condition -- re-resolve and patch
             scimGroupId = client.findGroupIdByExternalId(group.getId());
             if (scimGroupId.isEmpty()) scimGroupId = client.findGroupIdByDisplayName(group.getName());
         }
 
-        // Patch existing SCIM group (update displayName + replace members)
         return scimGroupId
                 .map(id -> client.patchGroup(id, ScimGroupMapper.buildReplaceGroupPatch(group.getName(), members)))
                 .orElse(false);
     }
 
-    /**
-     * Delete the SCIM /Groups resource corresponding to the Keycloak group.
-     * Returns true if deleted or already absent.
-     */
     private static boolean deleteScimGroup(ScimClient client, GroupModel group) {
-        java.util.Optional<String> scimGroupId = client.findGroupIdByExternalId(group.getId());
+        Optional<String> scimGroupId = client.findGroupIdByExternalId(group.getId());
         if (scimGroupId.isEmpty()) scimGroupId = client.findGroupIdByDisplayName(group.getName());
         if (scimGroupId.isEmpty()) {
             debug("Group '%s' not found in SCIM target; treating DELETE as NO-OP (already gone).", group.getName());
@@ -360,43 +470,90 @@ public final class ScimMembershipSync {
         return client.deleteGroup(scimGroupId.get());
     }
 
-    /**
-     * Resolves the current members of a Keycloak group into SCIM member references by
-     * looking up each member user in the SCIM /Users endpoint.
-     * Users not yet provisioned (no SCIM id found) are skipped; they will be picked up
-     * on the next group sync once the user-side provisioning has completed.
-     */
     private static List<ScimGroupMapper.ScimMemberRef> resolveGroupMembers(
             ScimClient client, GroupModel group, ComponentModel target,
             KeycloakSession session, RealmModel realm) {
-
-        List<ScimGroupMapper.ScimMemberRef> refs = new java.util.ArrayList<>();
+        List<ScimGroupMapper.ScimMemberRef> refs = new ArrayList<>();
         session.users().getGroupMembersStream(realm, group).forEach(user -> {
             String scimUserName = computeScimUserName(target, user);
             if (scimUserName == null || scimUserName.isBlank()) return;
-
-            java.util.Optional<String> scimId = resolveScimId(client, user.getId(), scimUserName);
+            Optional<String> scimId = resolveScimId(client, user.getId(), scimUserName);
             scimId.ifPresent(id -> refs.add(new ScimGroupMapper.ScimMemberRef(id, scimUserName)));
         });
         return refs;
     }
+
+    // =========================================================================
+    // In-scope resolution helpers
+    // =========================================================================
+
+    /**
+     * Returns the set of Keycloak users that are in scope for the given SCIM target.
+     * When CFG_FILTER_GROUP is set, only members of that group are returned.
+     * Otherwise, all users in the realm are returned.
+     */
+    private static List<UserModel> resolveInScopeUsers(KeycloakSession session, RealmModel realm, ComponentModel target) {
+        String filterGroup = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
+        if (filterGroup != null && !filterGroup.isBlank()) {
+            GroupModel group = findGroupByName(session, realm, filterGroup);
+            if (group == null) {
+                err("resolveInScopeUsers: filterGroup='%s' not found in realm=%s. Returning empty set.",
+                        filterGroup, realm.getName());
+                return List.of();
+            }
+            return session.users().getGroupMembersStream(realm, group).toList();
+        }
+        return session.users().getUsersStream(realm).toList();
+    }
+
+    /**
+     * Returns the set of Keycloak groups that are in scope for group provisioning.
+     * When CFG_GROUP_FILTER is set, only those named groups are returned.
+     * When blank, falls back to CFG_FILTER_GROUP.
+     * When neither is set, returns all top-level realm groups.
+     */
+    private static List<GroupModel> resolveInScopeGroups(KeycloakSession session, RealmModel realm, ComponentModel target) {
+        String groupFilter = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_GROUP_FILTER, null);
+        if (groupFilter == null || groupFilter.isBlank()) {
+            groupFilter = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
+        }
+        if (groupFilter != null && !groupFilter.isBlank()) {
+            List<GroupModel> result = new ArrayList<>();
+            for (String name : groupFilter.split(",")) {
+                String trimmed = name.trim();
+                if (trimmed.isEmpty()) continue;
+                GroupModel g = findGroupByName(session, realm, trimmed);
+                if (g != null) {
+                    result.add(g);
+                } else {
+                    err("resolveInScopeGroups: group='%s' not found in realm=%s. Skipping.", trimmed, realm.getName());
+                }
+            }
+            return result;
+        }
+        return session.groups().getTopLevelGroupsStream(realm).toList();
+    }
+
+    private static GroupModel findGroupByName(KeycloakSession session, RealmModel realm, String name) {
+        return session.groups().searchForGroupByNameStream(realm, name, false, 0, 1)
+                .filter(g -> name.equals(g.getName()))
+                .findFirst()
+                .orElse(null);
+    }
+
+    // =========================================================================
+    // SCIM push helpers
+    // =========================================================================
 
     private static boolean isGroupProvisioningEnabled(ComponentModel target) {
         return Boolean.parseBoolean(
                 ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_PROVISION_GROUPS, "false"));
     }
 
-    /**
-     * Removes the "<componentId>:1" entry from MembershipState.PENDING_ATTRIBUTE_NAME
-     * for the given user, if present. Written through local storage for the same
-     * read-only-federation reason as the main tracking attribute.
-     */
     private static void clearPendingFlag(KeycloakSession session, RealmModel realm, UserModel user, String componentId) {
         List<String> currentPending = user.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME).toList();
         String pendingValue = MembershipState.pendingValue(componentId);
-        if (!currentPending.contains(pendingValue)) {
-            return; // nothing to clear
-        }
+        if (!currentPending.contains(pendingValue)) return;
 
         List<String> updatedPending = new ArrayList<>(currentPending);
         updatedPending.remove(pendingValue);
@@ -407,12 +564,9 @@ public final class ScimMembershipSync {
                     user.getId(), user.getUsername(), componentId);
             return;
         }
-
         localUser.setAttribute(MembershipState.PENDING_ATTRIBUTE_NAME, updatedPending);
         debug("Cleared pending flag for user=%s componentId=%s -> %s", user.getUsername(), componentId, updatedPending);
     }
-
-    /* ===== SCIM push helpers (mirrors ScimEventListenerProvider logic) ===== */
 
     private static String computeScimUserName(ComponentModel t, UserModel user) {
         String strategy = ScimTargetProviderFactory.get(t, ScimTargetProviderFactory.CFG_UNAME_STRATEGY, "username");
@@ -445,18 +599,31 @@ public final class ScimMembershipSync {
         }
     }
 
+    /**
+     * Deprovisions a SCIM user whose Keycloak externalId is known (normal remove-from-scope path).
+     * Looks up the SCIM id first by externalId then by userName.
+     */
     private static boolean deprovisionUser(ComponentModel t, ScimClient scim, String externalId, String scimUserName) {
         Optional<String> id = resolveScimId(scim, externalId, scimUserName);
         if (id.isEmpty()) {
             debug("Deprovision NO-OP: user not found in SCIM target=%s (externalId=%s userName=%s)",
                     t.getName(), externalId, scimUserName);
-            return true; // nothing to remove counts as a successful removal
+            return true;
         }
+        return deprovisionUserById(t, scim, id.get());
+    }
+
+    /**
+     * Deprovisions a SCIM user by their SCIM id (used by the reconciliation pass, where the
+     * SCIM id is already known from the GET /Users listing but the Keycloak user may be gone).
+     * Applies the configured deprovisionAction (deactivate or delete).
+     */
+    private static boolean deprovisionUserById(ComponentModel t, ScimClient scim, String scimId) {
         String mode = ScimTargetProviderFactory.get(t, ScimTargetProviderFactory.CFG_DEPROVISION, "deactivate");
         if ("delete".equals(mode)) {
-            return scim.deleteUser(id.get());
+            return scim.deleteUser(scimId);
         }
-        return scim.patchUser(id.get(), ScimMapper.buildDeactivatePatch());
+        return scim.patchUser(scimId, ScimMapper.buildDeactivatePatch());
     }
 
     private static Optional<String> resolveScimId(ScimClient scim, String externalId, String scimUserName) {
