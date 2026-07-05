@@ -47,6 +47,16 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
     /** Deprovisioning behavior on delete / group removal: deactivate | delete */
     public static final String CFG_DEPROVISION    = "deprovisionAction";
 
+    /** When "true", SCIM /Groups resources are created/updated/deleted in addition to users. */
+    public static final String CFG_PROVISION_GROUPS = "provisionGroups";
+
+    /**
+     * Comma-separated list of Keycloak group names to sync as SCIM Groups.
+     * Blank = sync the group already named in CFG_FILTER_GROUP (if any).
+     * Only meaningful when CFG_PROVISION_GROUPS=true.
+     */
+    public static final String CFG_GROUP_FILTER = "groupFilter";
+
     private static ProviderConfigProperty list(String help, String name, List<String> options, String def, boolean required) {
         ProviderConfigProperty p = new ProviderConfigProperty();
         p.setType(ProviderConfigProperty.LIST_TYPE);
@@ -75,7 +85,19 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
 
         list("Deprovisioning behavior when a user is deleted or removed from the filter group: "
             + "'deactivate' (PATCH active=false, default) or 'delete' (DELETE /Users/{id}, e.g. for vCenter).",
-            CFG_DEPROVISION, List.of("deactivate","delete"), "deactivate", true)
+            CFG_DEPROVISION, List.of("deactivate","delete"), "deactivate", true),
+
+        prop(ProviderConfigProperty.BOOLEAN_TYPE, CFG_PROVISION_GROUPS,
+            "When enabled, a SCIM /Groups resource is kept in sync for each Keycloak group that "
+            + "falls within the configured filter. Members are reconciled on every LDAP sync and on "
+            + "real-time membership events.",
+            false, "Provision Groups"),
+
+        prop(ProviderConfigProperty.STRING_TYPE, CFG_GROUP_FILTER,
+            "Comma-separated Keycloak group names to provision as SCIM Groups (e.g. admins,devs). "
+            + "Leave blank to use the same group as the user filter (Filter Group). "
+            + "Only evaluated when 'Provision Groups' is enabled.",
+            false, "Group Sync Filter (optional)")
     );
 
     @Override
