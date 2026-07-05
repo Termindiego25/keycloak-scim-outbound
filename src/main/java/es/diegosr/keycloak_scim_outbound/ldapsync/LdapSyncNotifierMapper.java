@@ -14,6 +14,8 @@ import org.keycloak.storage.ldap.idm.query.internal.LDAPQuery;
 import org.keycloak.storage.ldap.mappers.LDAPStorageMapper;
 import org.keycloak.storage.user.SynchronizationResult;
 
+import es.diegosr.keycloak_scim_outbound.ldapsync.GroupSyncState;
+
 import javax.naming.AuthenticationException;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -291,7 +293,122 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
         }
 
         info("Targeted membership check done for realm=%s: usersChecked=%d", realm.getName(), usersChecked);
+
+        // Also check whether any group-level SCIM sync state has changed (group created,
+        // renamed, or left scope). This is independent of user candidates.
+        checkAndUpdateGroupStates(realm, scimTargets);
+
         return new SynchronizationResult();
+    }
+
+    /**
+     * For each SCIM target that has group provisioning enabled, compares the current set of
+     * Keycloak groups in scope against the SCIM sync state stored in group attributes
+     * (GroupSyncState.STATE_ATTR_PREFIX + componentId) and marks transitions:
+     *
+     *   group is in scope and has no SYNCED state  -> mark NEEDS_SYNC (new group or renamed)
+     *   group was SYNCED but is now renamed        -> mark NEEDS_SYNC  (name change detected
+     *                                                  by storing the last-synced displayName)
+     *
+     * "In scope" means: the group's name is listed in CFG_GROUP_FILTER (if set), or equals
+     * CFG_FILTER_GROUP, for a target that has CFG_PROVISION_GROUPS=true.
+     *
+     * Groups that were previously SYNCED but are no longer in scope (e.g. filter config
+     * changed) are marked NEEDS_DELETE. Actual deletion is handled by ScimMembershipSync.
+     *
+     * Writes go directly to GroupModel.setAttribute(), which is always local storage.
+     */
+    private void checkAndUpdateGroupStates(RealmModel realm, List<ComponentModel> scimTargets) {
+        for (ComponentModel target : scimTargets) {
+            if (!isGroupProvisioningEnabled(target)) continue;
+
+            List<String> scopedGroupNames = resolveGroupFilter(target);
+            if (scopedGroupNames.isEmpty()) {
+                debug("Target=%s: group provisioning enabled but no group names resolved. Skipping group state check.", target.getName());
+                continue;
+            }
+
+            // Collect groups currently in scope
+            java.util.Set<String> inScopeIds = new java.util.HashSet<>();
+            for (String groupName : scopedGroupNames) {
+                session.groups().searchForGroupByNameStream(realm, groupName, true, null, null)
+                        .forEach(g -> {
+                            inScopeIds.add(g.getId());
+                            Optional<GroupSyncState.State> existingState = GroupSyncState.getState(g, target.getId());
+
+                            if (existingState.isEmpty() || existingState.get() == GroupSyncState.State.NEEDS_DELETE) {
+                                // Group is in scope and either new or was previously scheduled for deletion
+                                GroupSyncState.setState(g, target.getId(), GroupSyncState.State.NEEDS_SYNC);
+                                info("MARK group NEEDS_SYNC group='%s' target=%s (was %s)",
+                                        g.getName(), target.getName(),
+                                        existingState.map(Enum::name).orElse("<none>"));
+                            } else if (existingState.get() == GroupSyncState.State.SYNCED) {
+                                // Check if name changed since last sync.
+                                // We store the synced name in a sibling attribute to detect renames.
+                                String lastSyncedName = g.getFirstAttribute(GroupSyncState.STATE_ATTR_PREFIX + target.getId() + ".name");
+                                if (lastSyncedName != null && !lastSyncedName.equals(g.getName())) {
+                                    GroupSyncState.setState(g, target.getId(), GroupSyncState.State.NEEDS_SYNC);
+                                    info("MARK group NEEDS_SYNC (renamed '%s' -> '%s') target=%s",
+                                            lastSyncedName, g.getName(), target.getName());
+                                } else {
+                                    debug("Group '%s' already SYNCED and not renamed for target=%s. No-op.",
+                                            g.getName(), target.getName());
+                                }
+                            }
+                            // NEEDS_SYNC stays as-is (undelivered from prior sync)
+                        });
+            }
+
+            // Any group previously SYNCED (or NEEDS_SYNC) for this target that is no longer
+            // in scope must be removed from the SCIM target.
+            GroupSyncState.findPendingGroups(realm).forEach(g -> {
+                if (!inScopeIds.contains(g.getId())) {
+                    Optional<GroupSyncState.State> st = GroupSyncState.getState(g, target.getId());
+                    if (st.isPresent() && st.get() != GroupSyncState.State.NEEDS_DELETE) {
+                        GroupSyncState.setState(g, target.getId(), GroupSyncState.State.NEEDS_DELETE);
+                        info("MARK group NEEDS_DELETE group='%s' target=%s (left scope)", g.getName(), target.getName());
+                    }
+                }
+            });
+            // Also check groups that are SYNCED (no pending flag) but left scope
+            realm.getGroupsStream().forEach(g -> {
+                if (!inScopeIds.contains(g.getId())) {
+                    Optional<GroupSyncState.State> st = GroupSyncState.getState(g, target.getId());
+                    if (st.isPresent() && st.get() == GroupSyncState.State.SYNCED) {
+                        GroupSyncState.setState(g, target.getId(), GroupSyncState.State.NEEDS_DELETE);
+                        info("MARK group NEEDS_DELETE group='%s' target=%s (was SYNCED, left scope)", g.getName(), target.getName());
+                    }
+                }
+            });
+        }
+    }
+
+    private boolean isGroupProvisioningEnabled(ComponentModel target) {
+        return Boolean.parseBoolean(
+                es.diegosr.keycloak_scim_outbound.ui.ScimTargetProviderFactory.get(
+                        target, es.diegosr.keycloak_scim_outbound.ui.ScimTargetProviderFactory.CFG_PROVISION_GROUPS, "false"));
+    }
+
+    /**
+     * Returns the list of group names that should be provisioned as SCIM Groups for this target.
+     * Priority: CFG_GROUP_FILTER (comma-separated) > CFG_FILTER_GROUP (single value).
+     */
+    private List<String> resolveGroupFilter(ComponentModel target) {
+        String groupFilter = es.diegosr.keycloak_scim_outbound.ui.ScimTargetProviderFactory.get(
+                target, es.diegosr.keycloak_scim_outbound.ui.ScimTargetProviderFactory.CFG_GROUP_FILTER, null);
+        if (groupFilter != null && !groupFilter.isBlank()) {
+            return java.util.Arrays.stream(groupFilter.split(","))
+                    .map(String::trim)
+                    .filter(s -> !s.isEmpty())
+                    .distinct()
+                    .toList();
+        }
+        String filterGroup = es.diegosr.keycloak_scim_outbound.ui.ScimTargetProviderFactory.get(
+                target, es.diegosr.keycloak_scim_outbound.ui.ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
+        if (filterGroup != null && !filterGroup.isBlank()) {
+            return List.of(filterGroup.trim());
+        }
+        return List.of();
     }
 
     /**
