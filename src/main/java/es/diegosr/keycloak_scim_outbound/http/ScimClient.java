@@ -201,6 +201,7 @@ public class ScimClient {
 
     /**
      * Shared filter-based id lookup for both /Users and /Groups.
+     * Logs the full response body unconditionally (no truncation) for diagnostics.
      * If the server ignores the filter and returns more than one result,
      * returns Optional.empty() so the caller can fall back to a different lookup
      * (e.g. displayName for groups, userName for users).
@@ -212,9 +213,12 @@ public class ScimClient {
             String query  = "filter=" + urlEncode(filter);
             HttpRequest req = baseRequestBuilder("/" + resource + "?" + query).GET().build();
             HttpResponse<String> res = sendWithRetries(req);
+            String body = res.body() != null ? res.body() : "";
+            httpInfo("GET /%s?%s -> %d BODY: %s", resource, query, res.statusCode(), body);
             if (is2xx(res.statusCode())) {
-                ScimListResponse r = parseListResponse(res.body());
-                httpInfo("GET /%s?%s -> %d totalResults=%d", resource, query, res.statusCode(), r.totalResults());
+                ScimListResponse r = parseListResponse(body);
+                httpInfo("GET /%s?%s totalResults=%d resourcesPresent=%b firstId=%s",
+                        resource, query, r.totalResults(), r.resourcesPresent(), r.firstId().orElse("<none>"));
                 if (r.totalResults() > 1) {
                     // Server returned multiple results: the filter was ignored.
                     // Return empty so the caller falls back to its next lookup strategy.
@@ -224,10 +228,9 @@ public class ScimClient {
                 if (r.firstId().isPresent()) return r.firstId();
                 if (r.totalResults() > 0 || r.resourcesPresent()) {
                     httpErr("Could not extract id from SCIM response for %s (Resources present but no id found).", resource);
-                    httpErr("DEBUG response body (first 800 chars): %s", res.body() != null && res.body().length() > 800 ? res.body().substring(0, 800) + " [truncated]" : res.body());
                 }
             } else {
-                httpErr("GET /%s?%s -> %d %s", resource, query, res.statusCode(), safeBody(res));
+                httpErr("GET /%s?%s -> %d (non-2xx)", resource, query, res.statusCode());
             }
         } catch (Exception e) {
             httpErr("%s failed: %s", operation, e.getMessage());
@@ -244,10 +247,12 @@ public class ScimClient {
             HttpRequest req = baseRequestBuilder("/Users?" + query).GET().build();
 
             HttpResponse<String> res = sendWithRetries(req);
+            String body = res.body() != null ? res.body() : "";
+            httpInfo("GET /Users?%s -> %d BODY: %s", query, res.statusCode(), body);
             if (is2xx(res.statusCode())) {
-                String body = res.body();
                 ScimListResponse users = parseListResponse(body);
-                httpInfo("GET /Users?%s -> %d totalResults=%d", query, res.statusCode(), users.totalResults());
+                httpInfo("GET /Users?%s totalResults=%d resourcesPresent=%b firstId=%s",
+                        query, users.totalResults(), users.resourcesPresent(), users.firstId().orElse("<none>"));
                 if (users.totalResults() > 1) {
                     // Server returned multiple results: the filter was ignored.
                     // Return empty so the caller falls back to a userName lookup.
@@ -259,10 +264,9 @@ public class ScimClient {
                 }
                 if (users.totalResults() > 0 || users.resourcesPresent()) {
                     httpErr("Could not extract user id from SCIM response (Resources present but no id found).");
-                    httpErr("DEBUG response body (first 800 chars): %s", body.length() > 800 ? body.substring(0, 800) + " [truncated]" : body);
                 }
             } else {
-                httpErr("GET /Users?%s -> %d %s", query, res.statusCode(), safeBody(res));
+                httpErr("GET /Users?%s -> %d (non-2xx)", query, res.statusCode());
             }
         } catch (Exception e) {
             httpErr("%s failed: %s", operation, e.getMessage());
