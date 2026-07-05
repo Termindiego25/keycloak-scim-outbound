@@ -239,6 +239,12 @@ public class ScimClient {
                 String body = res.body();
                 ScimListResponse users = parseListResponse(body);
                 httpInfo("GET /Users?%s -> %d totalResults=%d", query, res.statusCode(), users.totalResults());
+                if (users.totalResults() > 1) {
+                    // Server returned multiple results: the filter was ignored.
+                    // Return empty so the caller falls back to a userName lookup.
+                    httpInfo("GET /Users?%s: totalResults=%d > 1 suggests filter was ignored by server; returning empty to trigger userName fallback", query, users.totalResults());
+                    return Optional.empty();
+                }
                 if (users.firstId().isPresent()) {
                     return users.firstId();
                 }
@@ -262,7 +268,12 @@ public class ScimClient {
 
         JsonNode root = JSON.readTree(body);
         int totalResults = root.path("totalResults").asInt(0);
+
+        // Try "Resources" (RFC 7644 spec-compliant) then "resources" (lowercase, non-standard)
         JsonNode resources = root.path("Resources");
+        if (!resources.isArray() || resources.isEmpty()) {
+            resources = root.path("resources");
+        }
         boolean resourcesPresent = resources.isArray() && !resources.isEmpty();
 
         if (!resourcesPresent) {
