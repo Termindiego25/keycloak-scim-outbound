@@ -11,7 +11,7 @@ import java.time.Duration;
 import java.util.Optional;
 
 /**
- * Minimal SCIM v2 client focused on Users resource.
+ * Minimal SCIM v2 client for Users and Groups resources.
  */
 public class ScimClient {
     private final HttpClient http;
@@ -56,6 +56,87 @@ public class ScimClient {
     /** Find user by externalId and return SCIM id if present. */
     public Optional<String> findUserIdByExternalId(String externalId) {
         return findUserIdByFilter("externalId", externalId, "findUserIdByExternalId");
+    }
+
+    // -- Group operations -----------------------------------------------------
+
+    /** Find SCIM Group id by externalId (= Keycloak group UUID). */
+    public Optional<String> findGroupIdByExternalId(String externalId) {
+        return findEntityIdByFilter("Groups", "externalId", externalId, "findGroupIdByExternalId");
+    }
+
+    /** Find SCIM Group id by displayName (fallback when externalId not yet stored remotely). */
+    public Optional<String> findGroupIdByDisplayName(String displayName) {
+        return findEntityIdByFilter("Groups", "displayName", displayName, "findGroupIdByDisplayName");
+    }
+
+    /** POST /Groups -- returns true on 200/201. */
+    public boolean createGroup(String jsonPayload) {
+        try {
+            HttpRequest req = baseRequestBuilder("/Groups")
+                    .header("Content-Type", "application/scim+json")
+                    .POST(HttpRequest.BodyPublishers.ofString(jsonPayload))
+                    .build();
+            HttpResponse<String> res = sendWithRetries(req);
+            if (res.statusCode() == 201 || res.statusCode() == 200) return true;
+            if (res.statusCode() == 409) {
+                httpInfo("POST /Groups got 409 conflict: %s", safeBody(res));
+            } else {
+                httpErr("POST /Groups -> %d %s", res.statusCode(), safeBody(res));
+            }
+            return false;
+        } catch (Exception e) {
+            httpErr("POST /Groups failed: %s", e.getMessage());
+            return false;
+        }
+    }
+
+    /** PATCH /Groups/{id} -- e.g. replace members, rename displayName. */
+    public boolean patchGroup(String id, String jsonPatch) {
+        return sendJson("PATCH", "/Groups/" + urlEncode(id), jsonPatch, 200, 204);
+    }
+
+    /** DELETE /Groups/{id} -- returns true on 200/204/404. */
+    public boolean deleteGroup(String id) {
+        String path = "/Groups/" + urlEncode(id);
+        try {
+            HttpRequest req = baseRequestBuilder(path).DELETE().build();
+            HttpResponse<String> res = sendWithRetries(req);
+            boolean ok = res.statusCode() == 204 || res.statusCode() == 200 || res.statusCode() == 404;
+            if (!ok) httpErr("DELETE %s -> %d %s", path, res.statusCode(), safeBody(res));
+            return ok;
+        } catch (Exception e) {
+            httpErr("DELETE %s failed: %s", path, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Shared filter-based id lookup for both /Users and /Groups.
+     * Replaces the previous Users-only findUserIdByFilter so both resources
+     * use the same retry and logging logic.
+     */
+    private Optional<String> findEntityIdByFilter(String resource, String attribute, String value, String operation) {
+        if (value == null || value.isBlank()) return Optional.empty();
+        try {
+            String filter = attribute + " eq " + scimFilterString(value);
+            String query  = "filter=" + urlEncode(filter);
+            HttpRequest req = baseRequestBuilder("/" + resource + "?" + query).GET().build();
+            HttpResponse<String> res = sendWithRetries(req);
+            if (is2xx(res.statusCode())) {
+                ScimListResponse r = parseListResponse(res.body());
+                httpInfo("GET /%s?%s -> %d totalResults=%d", resource, query, res.statusCode(), r.totalResults());
+                if (r.firstId().isPresent()) return r.firstId();
+                if (r.totalResults() > 0 || r.resourcesPresent()) {
+                    httpErr("Could not extract id from SCIM response for %s (Resources present but no id found).", resource);
+                }
+            } else {
+                httpErr("GET /%s?%s -> %d %s", resource, query, res.statusCode(), safeBody(res));
+            }
+        } catch (Exception e) {
+            httpErr("%s failed: %s", operation, e.getMessage());
+        }
+        return Optional.empty();
     }
 
     private Optional<String> findUserIdByFilter(String attribute, String value, String operation) {
@@ -212,7 +293,7 @@ public class ScimClient {
     private static String userPath(String id) { return "/Users/" + urlEncode(id); }
     private static String urlEncode(String s) { return URLEncoder.encode(s, StandardCharsets.UTF_8).replace("+", "%20"); }
     private static void sleep(long ms) { try { Thread.sleep(ms); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); } }
-    private static String safeBody(HttpResponse<String> res) { String b = res.body(); return b == null ? "" : (b.length() > 400 ? b.substring(0, 400) + " …" : b); }
+    private static String safeBody(HttpResponse<String> res) { String b = res.body(); return b == null ? "" : (b.length() > 400 ? b.substring(0, 400) + " ..." : b); }
 
     private static String scimFilterString(String value) { return "\"" + jsonEscape(value) + "\""; }
     private static String jsonEscape(String s) {
