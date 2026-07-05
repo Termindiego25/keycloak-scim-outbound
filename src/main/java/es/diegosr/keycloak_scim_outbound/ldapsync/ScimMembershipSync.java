@@ -490,7 +490,8 @@ public final class ScimMembershipSync {
     /**
      * Returns the set of Keycloak users that are in scope for the given SCIM target.
      * When CFG_FILTER_GROUP is set, only members of that group are returned.
-     * Otherwise, all users in the realm are returned.
+     * Otherwise, all users in the realm are returned via searchForUserStream with an
+     * empty filter map (compatible with Keycloak versions that do not have getUsersStream).
      */
     private static List<UserModel> resolveInScopeUsers(KeycloakSession session, RealmModel realm, ComponentModel target) {
         String filterGroup = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
@@ -503,7 +504,10 @@ public final class ScimMembershipSync {
             }
             return session.users().getGroupMembersStream(realm, group).toList();
         }
-        return session.users().getUsersStream(realm).toList();
+        // searchForUserStream with an empty map returns all users and is available across
+        // all supported Keycloak versions. getUsersStream(RealmModel) does not exist in
+        // older KC versions and must not be used.
+        return session.users().searchForUserStream(realm, Map.of()).toList();
     }
 
     /**
