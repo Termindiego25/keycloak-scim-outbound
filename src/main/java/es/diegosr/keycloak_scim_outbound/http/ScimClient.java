@@ -215,6 +215,7 @@ public class ScimClient {
                 if (r.firstId().isPresent()) return r.firstId();
                 if (r.totalResults() > 0 || r.resourcesPresent()) {
                     httpErr("Could not extract id from SCIM response for %s (Resources present but no id found).", resource);
+                    httpErr("DEBUG response body (first 800 chars): %s", res.body() != null && res.body().length() > 800 ? res.body().substring(0, 800) + " [truncated]" : res.body());
                 }
             } else {
                 httpErr("GET /%s?%s -> %d %s", resource, query, res.statusCode(), safeBody(res));
@@ -243,6 +244,7 @@ public class ScimClient {
                 }
                 if (users.totalResults() > 0 || users.resourcesPresent()) {
                     httpErr("Could not extract user id from SCIM response (Resources present but no id found).");
+                    httpErr("DEBUG response body (first 800 chars): %s", body.length() > 800 ? body.substring(0, 800) + " [truncated]" : body);
                 }
             } else {
                 httpErr("GET /Users?%s -> %d %s", query, res.statusCode(), safeBody(res));
