@@ -267,9 +267,22 @@ public class ScimClient {
             return new ScimListResponse(totalResults, Optional.empty(), false);
         }
 
-        JsonNode id = resources.get(0).path("id");
-        if (id.isTextual() && !id.asText().isBlank()) {
-            return new ScimListResponse(totalResults, Optional.of(id.asText()), true);
+        JsonNode first = resources.get(0);
+        // Accept id regardless of JSON type (string or number) for broad SCIM compat
+        JsonNode idNode = first.path("id");
+        if (!idNode.isMissingNode() && !idNode.isNull()) {
+            String idText = idNode.asText("").strip();
+            if (!idText.isBlank()) {
+                return new ScimListResponse(totalResults, Optional.of(idText), true);
+            }
+        }
+        // Fallback: some non-standard SCIM servers use "value" as the resource id field
+        JsonNode valueNode = first.path("value");
+        if (!valueNode.isMissingNode() && !valueNode.isNull()) {
+            String valueText = valueNode.asText("").strip();
+            if (!valueText.isBlank()) {
+                return new ScimListResponse(totalResults, Optional.of(valueText), true);
+            }
         }
         return new ScimListResponse(totalResults, Optional.empty(), true);
     }
