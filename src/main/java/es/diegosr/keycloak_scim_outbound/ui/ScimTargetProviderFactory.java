@@ -22,10 +22,18 @@ import java.util.List;
  * This does not store users; it only holds SCIM target configuration so the event listener
  * can read it and push SCIM operations accordingly.
  *
- * Implements ImportSynchronization so that clicking "Synchronize all users" /
- * "Synchronize changed users" on this provider's page in the admin console triggers
- * an immediate sweep of pending LDAP-driven membership changes for THIS target only,
- * instead of waiting for the next 5-minute timer tick.
+ * Implements ImportSynchronization so that Keycloak's built-in "Sync Settings" scheduler
+ * drives periodic sync without a custom timer:
+ *
+ *   sync()      -- "Synchronize all users" button / Periodic Full Sync toggle:
+ *                  Upserts every in-scope user and group unconditionally.
+ *                  Optionally reconciles stale SCIM entries (CFG_RECONCILE_USERS /
+ *                  CFG_RECONCILE_GROUPS) by querying GET /Users and GET /Groups and
+ *                  deprovisioning any entry whose externalId is no longer in scope.
+ *
+ *   syncSince() -- "Synchronize changed users" button / Periodic Changed Users Sync toggle:
+ *                  Consumes the pending-attribute bookkeeping written by LdapSyncNotifierMapper
+ *                  and pushes only users/groups that are flagged as changed.
  */
 public class ScimTargetProviderFactory implements UserStorageProviderFactory<ScimTargetProvider>, ImportSynchronization {
 
@@ -56,6 +64,21 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
      * Only meaningful when CFG_PROVISION_GROUPS=true.
      */
     public static final String CFG_GROUP_FILTER = "groupFilter";
+
+    /**
+     * When "true", a full sync queries GET /Users from the SCIM target and deprovisions
+     * any user whose externalId is not in the current in-scope Keycloak set.
+     * Disable for SCIM providers that do not support listing /Users.
+     */
+    public static final String CFG_RECONCILE_USERS = "reconcileUsers";
+
+    /**
+     * When "true", a full sync queries GET /Groups from the SCIM target and deletes
+     * any group whose externalId is not in the current in-scope Keycloak group set.
+     * Disable for SCIM providers that do not support listing /Groups.
+     * Only meaningful when CFG_PROVISION_GROUPS=true.
+     */
+    public static final String CFG_RECONCILE_GROUPS = "reconcileGroups";
 
     private static ProviderConfigProperty list(String help, String name, List<String> options, String def, boolean required) {
         ProviderConfigProperty p = new ProviderConfigProperty();
@@ -89,15 +112,27 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
 
         prop(ProviderConfigProperty.BOOLEAN_TYPE, CFG_PROVISION_GROUPS,
             "When enabled, a SCIM /Groups resource is kept in sync for each Keycloak group that "
-            + "falls within the configured filter. Members are reconciled on every LDAP sync and on "
-            + "real-time membership events.",
+            + "falls within the configured filter. Members are reconciled on every sync.",
             false, "Provision Groups"),
 
         prop(ProviderConfigProperty.STRING_TYPE, CFG_GROUP_FILTER,
             "Comma-separated Keycloak group names to provision as SCIM Groups (e.g. admins,devs). "
             + "Leave blank to use the same group as the user filter (Filter Group). "
             + "Only evaluated when 'Provision Groups' is enabled.",
-            false, "Group Sync Filter (optional)")
+            false, "Group Sync Filter (optional)"),
+
+        prop(ProviderConfigProperty.BOOLEAN_TYPE, CFG_RECONCILE_USERS,
+            "During a full sync, query GET /Users from the SCIM target and deprovision any user "
+            + "whose externalId is no longer in the in-scope Keycloak set. "
+            + "Disable if the SCIM provider does not support listing /Users.",
+            false, "Reconcile Users (full sync)"),
+
+        prop(ProviderConfigProperty.BOOLEAN_TYPE, CFG_RECONCILE_GROUPS,
+            "During a full sync, query GET /Groups from the SCIM target and delete any group "
+            + "whose externalId is no longer in the in-scope Keycloak group set. "
+            + "Only meaningful when 'Provision Groups' is enabled. "
+            + "Disable if the SCIM provider does not support listing /Groups.",
+            false, "Reconcile Groups (full sync)")
     );
 
     @Override
@@ -152,51 +187,91 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
         return PROPS;
     }
 
-    /* ===== ImportSynchronization: triggered by the "Synchronize" buttons in the admin console =====
+    /* ===== ImportSynchronization =====
      * NOTE: Keycloak's ImportSynchronization interface takes UserStorageProviderModel (not the
      * plain ComponentModel) as the last parameter -- see org.keycloak.storage.user.ImportSynchronization
      * in keycloak-server-spi-private for the exact signature. */
 
+    /**
+     * Called by:
+     *   - "Synchronize all users" button in the admin console
+     *   - Keycloak's "Periodic Full Sync" scheduler (when enabled in Sync Settings)
+     *
+     * Performs a full sync: upserts every in-scope user and group unconditionally,
+     * then optionally reconciles stale SCIM entries (CFG_RECONCILE_USERS / CFG_RECONCILE_GROUPS).
+     */
     @Override
     public SynchronizationResult sync(KeycloakSessionFactory sessionFactory, String realmId, UserStorageProviderModel model) {
-        info("Manual 'Synchronize all users' triggered for target=%s (componentId=%s) realm=%s",
+        info("Full sync triggered for target=%s (componentId=%s) realm=%s",
                 model.getName(), model.getId(), realmId);
-        return runSweep(sessionFactory, realmId, model);
+        return runFullSync(sessionFactory, realmId, model);
     }
 
+    /**
+     * Called by:
+     *   - "Synchronize changed users" button in the admin console
+     *   - Keycloak's "Periodic Changed Users Sync" scheduler (when enabled in Sync Settings)
+     *
+     * Performs a changed-users sweep: consumes the pending-attribute bookkeeping written by
+     * LdapSyncNotifierMapper and pushes only users/groups that are flagged as changed since
+     * the last LDAP sync.
+     */
     @Override
     public SynchronizationResult syncSince(Date lastSync, KeycloakSessionFactory sessionFactory, String realmId, UserStorageProviderModel model) {
-        info("Manual 'Synchronize changed users' triggered for target=%s (componentId=%s) realm=%s lastSync=%s",
+        info("Changed-users sync triggered for target=%s (componentId=%s) realm=%s lastSync=%s",
                 model.getName(), model.getId(), realmId, lastSync);
-        // We don't have an incremental changed-users query for our own attribute state,
-        // so we just run the same full pending-entries sweep, scoped to this component.
-        return runSweep(sessionFactory, realmId, model);
+        return runPendingSweep(sessionFactory, realmId, model);
     }
 
-    private SynchronizationResult runSweep(KeycloakSessionFactory sessionFactory, String realmId, ComponentModel model) {
+    private SynchronizationResult runFullSync(KeycloakSessionFactory sessionFactory, String realmId, ComponentModel model) {
         long start = System.currentTimeMillis();
+        final int[] counts = {0, 0}; // [added, failed]
         try {
             KeycloakModelUtils.runJobInTransaction(sessionFactory, session -> {
                 RealmModel realm = session.realms().getRealm(realmId);
                 if (realm == null) {
-                    err("Realm not found for realmId=%s during manual sync of target=%s", realmId, model.getName());
+                    err("Realm not found for realmId=%s during full sync of target=%s", realmId, model.getName());
                     return;
                 }
-                // The session created by runJobInTransaction has no realm bound to its context yet.
-                // Downstream code (e.g. UserModel#setAttribute, group lookups) relies on
-                // session.getContext().getRealm() being set, so bind it explicitly before use.
                 session.getContext().setRealm(realm);
-                ScimMembershipSync.processPendingMembershipChanges(session, realm, model.getId());
+                int[] result = ScimMembershipSync.fullSync(session, realm, model.getId());
+                counts[0] = result[0];
+                counts[1] = result[1];
             });
-            info("Manual sync for target=%s completed in %dms", model.getName(), System.currentTimeMillis() - start);
+            info("Full sync for target=%s completed in %dms (added=%d failed=%d)",
+                    model.getName(), System.currentTimeMillis() - start, counts[0], counts[1]);
         } catch (Exception e) {
-            err("Manual sync for target=%s FAILED: %s", model.getName(), e.getMessage());
+            err("Full sync for target=%s FAILED: %s", model.getName(), e.getMessage());
             SynchronizationResult failed = new SynchronizationResult();
             failed.setFailed(1);
             return failed;
         }
         SynchronizationResult result = new SynchronizationResult();
+        result.setAdded(counts[0]);
+        result.setFailed(counts[1]);
         return result;
+    }
+
+    private SynchronizationResult runPendingSweep(KeycloakSessionFactory sessionFactory, String realmId, ComponentModel model) {
+        long start = System.currentTimeMillis();
+        try {
+            KeycloakModelUtils.runJobInTransaction(sessionFactory, session -> {
+                RealmModel realm = session.realms().getRealm(realmId);
+                if (realm == null) {
+                    err("Realm not found for realmId=%s during changed-users sync of target=%s", realmId, model.getName());
+                    return;
+                }
+                session.getContext().setRealm(realm);
+                ScimMembershipSync.processPendingMembershipChanges(session, realm, model.getId());
+            });
+            info("Changed-users sync for target=%s completed in %dms", model.getName(), System.currentTimeMillis() - start);
+        } catch (Exception e) {
+            err("Changed-users sync for target=%s FAILED: %s", model.getName(), e.getMessage());
+            SynchronizationResult failed = new SynchronizationResult();
+            failed.setFailed(1);
+            return failed;
+        }
+        return new SynchronizationResult();
     }
 
     /* ===== Helpers ===== */
