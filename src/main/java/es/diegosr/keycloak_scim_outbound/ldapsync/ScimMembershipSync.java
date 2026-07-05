@@ -605,7 +605,7 @@ public final class ScimMembershipSync {
 
     /**
      * Deprovisions a SCIM user whose Keycloak externalId is known (normal remove-from-scope path).
-     * Looks up the SCIM id first by externalId then by userName.
+     * Looks up the SCIM id first by userName then by externalId.
      */
     private static boolean deprovisionUser(ComponentModel t, ScimClient scim, String externalId, String scimUserName) {
         Optional<String> id = resolveScimId(scim, externalId, scimUserName);
@@ -630,12 +630,18 @@ public final class ScimMembershipSync {
         return scim.patchUser(scimId, ScimMapper.buildDeactivatePatch());
     }
 
+    /**
+     * Resolves the SCIM id for a user. Tries userName first (most SCIM servers honour this
+     * filter reliably), then falls back to externalId lookup if userName yields nothing.
+     */
     private static Optional<String> resolveScimId(ScimClient scim, String externalId, String scimUserName) {
-        Optional<String> id = (externalId != null && !externalId.isBlank())
-                ? scim.findUserIdByExternalId(externalId)
+        // Try userName first (most SCIM servers honour this filter reliably),
+        // fall back to externalId lookup if userName yields nothing.
+        Optional<String> id = (scimUserName != null && !scimUserName.isBlank())
+                ? scim.findUserIdByUserName(scimUserName)
                 : Optional.empty();
-        if (id.isEmpty() && scimUserName != null && !scimUserName.isBlank()) {
-            id = scim.findUserIdByUserName(scimUserName);
+        if (id.isEmpty() && externalId != null && !externalId.isBlank()) {
+            id = scim.findUserIdByExternalId(externalId);
         }
         return id;
     }
