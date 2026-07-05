@@ -8,6 +8,10 @@ import org.keycloak.component.ComponentModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
+import es.diegosr.keycloak_scim_outbound.ldapsync.GroupSyncState;
+import es.diegosr.keycloak_scim_outbound.util.ScimGroupMapper;
+
+import org.keycloak.models.GroupModel;
 import org.keycloak.storage.UserStoragePrivateUtil;
 
 import java.util.ArrayList;
@@ -225,6 +229,161 @@ public final class ScimMembershipSync {
                         + "usersScanned=%d usersWithPending=%d pushedAdds=%d pushedRemoves=%d failures=%d durationMs=%d ===",
                 realm.getName(), componentIdFilter == null ? "<all>" : componentIdFilter,
                 usersScanned, usersWithPending, pushedAdds, pushedRemoves, failures, durationMs);
+
+        // Process any pending SCIM group changes (create/update/delete of /Groups resources)
+        processPendingGroupChanges(session, realm, targets);
+    }
+
+    /**
+     * For each SCIM target that has group provisioning enabled, iterates groups that have
+     * a pending sync state (NEEDS_SYNC or NEEDS_DELETE in GroupSyncState) and pushes the
+     * corresponding SCIM operation.
+     *
+     * NEEDS_SYNC  -> upsert /Groups (POST if not found, PATCH members+displayName if found).
+     *               Members are resolved by looking up each current Keycloak group member in
+     *               the SCIM /Users endpoint (by externalId, fallback by userName).
+     *               After a successful push the state is set to SYNCED and the synced name
+     *               is recorded in a sibling attribute for rename detection.
+     *
+     * NEEDS_DELETE -> DELETE /Groups/{id} (or skip if already gone from SCIM).
+     *                After a successful push, all state attributes for this target are removed
+     *                from the group.
+     *
+     * Groups are located via GroupSyncState.findPendingGroups(realm), which iterates all
+     * realm groups but checks only those with a non-empty "scim.outbound.pending" attribute.
+     * Group counts are typically small (hundreds at most), so this scan is cheap.
+     */
+    private static void processPendingGroupChanges(KeycloakSession session, RealmModel realm,
+                                                   List<ComponentModel> targets) {
+        for (ComponentModel target : targets) {
+            if (!isGroupProvisioningEnabled(target)) continue;
+
+            String base  = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_BASE_URL, null);
+            String token = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_TOKEN, null);
+            if (base == null || token == null) {
+                err("Target=%s incomplete configuration (baseUrl/token). Skipping group sync.", target.getName());
+                continue;
+            }
+            ScimClient client = new ScimClient(base, token);
+
+            List<GroupModel> pendingGroups = GroupSyncState.findPendingGroups(realm);
+            debug("Target=%s: %d group(s) with pending flags found.", target.getName(), pendingGroups.size());
+
+            for (GroupModel group : pendingGroups) {
+                java.util.Optional<GroupSyncState.State> stateOpt = GroupSyncState.getState(group, target.getId());
+                if (stateOpt.isEmpty()) continue; // no state for this target
+
+                GroupSyncState.State state = stateOpt.get();
+                if (state == GroupSyncState.State.SYNCED) continue; // nothing to do
+
+                debug("Processing group='%s' state=%s target=%s", group.getName(), state, target.getName());
+
+                try {
+                    if (state == GroupSyncState.State.NEEDS_SYNC) {
+                        boolean ok = upsertScimGroup(client, group, target, session, realm);
+                        if (ok) {
+                            // Record the synced name for rename detection on next sync
+                            group.setAttribute(GroupSyncState.STATE_ATTR_PREFIX + target.getId() + ".name",
+                                    java.util.List.of(group.getName()));
+                            GroupSyncState.clearState(group, target.getId());
+                            // Re-set as SYNCED (clearState removed the attribute, we need SYNCED)
+                            group.setAttribute(GroupSyncState.STATE_ATTR_PREFIX + target.getId(),
+                                    java.util.List.of(GroupSyncState.State.SYNCED.name()));
+                            // Remove the pending flag (no longer undelivered)
+                            GroupSyncState.removePendingFlag(group, target.getId());
+                            info("GROUP SYNC OK group='%s' target=%s", group.getName(), target.getName());
+                        } else {
+                            err("GROUP SYNC FAILED group='%s' target=%s. Will retry next run.", group.getName(), target.getName());
+                        }
+                    } else if (state == GroupSyncState.State.NEEDS_DELETE) {
+                        boolean ok = deleteScimGroup(client, group);
+                        if (ok) {
+                            GroupSyncState.clearState(group, target.getId());
+                            group.removeAttribute(GroupSyncState.STATE_ATTR_PREFIX + target.getId() + ".name");
+                            info("GROUP DELETE OK group='%s' target=%s", group.getName(), target.getName());
+                        } else {
+                            err("GROUP DELETE FAILED group='%s' target=%s. Will retry next run.", group.getName(), target.getName());
+                        }
+                    }
+                } catch (Exception e) {
+                    err("GROUP SYNC EXCEPTION group='%s' state=%s target=%s: %s",
+                            group.getName(), state, target.getName(), e.getMessage());
+                }
+            }
+        }
+    }
+
+    /**
+     * Upsert a SCIM /Groups resource:
+     *   1. Try to find it by externalId (Keycloak group UUID), then by displayName.
+     *   2. If not found: POST /Groups with all current members resolved.
+     *   3. If found: PATCH to replace displayName and members list.
+     * Returns true if the operation succeeded.
+     */
+    private static boolean upsertScimGroup(ScimClient client, GroupModel group,
+                                           ComponentModel target, KeycloakSession session, RealmModel realm) {
+        // Resolve current members of the Keycloak group into SCIM user ids
+        List<ScimGroupMapper.ScimMemberRef> members = resolveGroupMembers(client, group, target, session, realm);
+
+        // Look up existing SCIM group
+        java.util.Optional<String> scimGroupId = client.findGroupIdByExternalId(group.getId());
+        if (scimGroupId.isEmpty()) {
+            scimGroupId = client.findGroupIdByDisplayName(group.getName());
+        }
+
+        if (scimGroupId.isEmpty()) {
+            // Create new SCIM group
+            boolean created = client.createGroup(ScimGroupMapper.buildCreateGroup(group, members));
+            if (created) return true;
+            // 409 conflict: race condition -- re-resolve and patch
+            scimGroupId = client.findGroupIdByExternalId(group.getId());
+            if (scimGroupId.isEmpty()) scimGroupId = client.findGroupIdByDisplayName(group.getName());
+        }
+
+        // Patch existing SCIM group (update displayName + replace members)
+        return scimGroupId
+                .map(id -> client.patchGroup(id, ScimGroupMapper.buildReplaceGroupPatch(group.getName(), members)))
+                .orElse(false);
+    }
+
+    /**
+     * Delete the SCIM /Groups resource corresponding to the Keycloak group.
+     * Returns true if deleted or already absent.
+     */
+    private static boolean deleteScimGroup(ScimClient client, GroupModel group) {
+        java.util.Optional<String> scimGroupId = client.findGroupIdByExternalId(group.getId());
+        if (scimGroupId.isEmpty()) scimGroupId = client.findGroupIdByDisplayName(group.getName());
+        if (scimGroupId.isEmpty()) {
+            debug("Group '%s' not found in SCIM target; treating DELETE as NO-OP (already gone).", group.getName());
+            return true;
+        }
+        return client.deleteGroup(scimGroupId.get());
+    }
+
+    /**
+     * Resolves the current members of a Keycloak group into SCIM member references by
+     * looking up each member user in the SCIM /Users endpoint.
+     * Users not yet provisioned (no SCIM id found) are skipped; they will be picked up
+     * on the next group sync once the user-side provisioning has completed.
+     */
+    private static List<ScimGroupMapper.ScimMemberRef> resolveGroupMembers(
+            ScimClient client, GroupModel group, ComponentModel target,
+            KeycloakSession session, RealmModel realm) {
+
+        List<ScimGroupMapper.ScimMemberRef> refs = new java.util.ArrayList<>();
+        session.users().getGroupMembersStream(realm, group).forEach(user -> {
+            String scimUserName = computeScimUserName(target, user);
+            if (scimUserName == null || scimUserName.isBlank()) return;
+
+            java.util.Optional<String> scimId = resolveScimId(client, user.getId(), scimUserName);
+            scimId.ifPresent(id -> refs.add(new ScimGroupMapper.ScimMemberRef(id, scimUserName)));
+        });
+        return refs;
+    }
+
+    private static boolean isGroupProvisioningEnabled(ComponentModel target) {
+        return Boolean.parseBoolean(
+                ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_PROVISION_GROUPS, "false"));
     }
 
     /**
