@@ -8,6 +8,8 @@ import java.net.URLEncoder;
 import java.net.http.*;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -21,6 +23,9 @@ public class ScimClient {
     private final int maxRetries;
 
     private static final ObjectMapper JSON = new ObjectMapper();
+
+    /** Page size used when listing all Users or Groups for reconciliation. */
+    private static final int LIST_PAGE_SIZE = 500;
 
     public ScimClient(String baseUrl, String bearer) {
         this(baseUrl, bearer, Duration.ofSeconds(8), 3);
@@ -111,10 +116,91 @@ public class ScimClient {
         }
     }
 
+    // -- Reconciliation listing -----------------------------------------------
+
+    /**
+     * Fetches all SCIM Users via paginated GET /Users and returns a map of
+     * scimId -> externalId for every user that has a non-blank externalId.
+     * Users without an externalId are skipped (they were not provisioned by us).
+     *
+     * Returns an empty map and logs an error if the request fails.
+     * Callers guard this behind CFG_RECONCILE_USERS; only invoke when the SCIM
+     * provider is known to support GET /Users listing.
+     */
+    public Map<String, String> listAllUserExternalIds() {
+        return listAllExternalIds("Users");
+    }
+
+    /**
+     * Fetches all SCIM Groups via paginated GET /Groups and returns a map of
+     * scimId -> externalId for every group that has a non-blank externalId.
+     * Groups without an externalId are skipped (they were not provisioned by us).
+     *
+     * Returns an empty map and logs an error if the request fails.
+     * Callers guard this behind CFG_RECONCILE_GROUPS; only invoke when the SCIM
+     * provider is known to support GET /Groups listing.
+     */
+    public Map<String, String> listAllGroupExternalIds() {
+        return listAllExternalIds("Groups");
+    }
+
+    /**
+     * Generic paginated lister for any SCIM resource type.
+     * Iterates pages of LIST_PAGE_SIZE until all resources are fetched or an
+     * error occurs. Returns a map of scimId -> externalId.
+     */
+    private Map<String, String> listAllExternalIds(String resource) {
+        Map<String, String> result = new HashMap<>();
+        int startIndex = 1; // SCIM pagination is 1-based
+        int fetched = 0;
+        int totalResults = Integer.MAX_VALUE; // updated after first response
+
+        while (startIndex <= totalResults) {
+            String query = "startIndex=" + startIndex + "&count=" + LIST_PAGE_SIZE;
+            try {
+                HttpRequest req = baseRequestBuilder("/" + resource + "?" + query).GET().build();
+                HttpResponse<String> res = sendWithRetries(req);
+                if (!is2xx(res.statusCode())) {
+                    httpErr("GET /%s?%s -> %d %s (aborting reconciliation list)", resource, query, res.statusCode(), safeBody(res));
+                    break;
+                }
+
+                JsonNode root = JSON.readTree(res.body());
+                totalResults = root.path("totalResults").asInt(0);
+                JsonNode resources = root.path("Resources");
+                if (!resources.isArray() || resources.isEmpty()) break;
+
+                int pageCount = 0;
+                for (JsonNode item : resources) {
+                    String id = item.path("id").asText(null);
+                    String externalId = item.path("externalId").asText(null);
+                    if (id != null && !id.isBlank() && externalId != null && !externalId.isBlank()) {
+                        result.put(id, externalId);
+                    }
+                    pageCount++;
+                }
+
+                fetched += pageCount;
+                httpInfo("GET /%s page startIndex=%d count=%d -> got %d items (total fetched=%d of totalResults=%d)",
+                        resource, startIndex, LIST_PAGE_SIZE, pageCount, fetched, totalResults);
+
+                if (pageCount == 0) break; // no progress, avoid infinite loop
+                startIndex += LIST_PAGE_SIZE;
+
+            } catch (Exception e) {
+                httpErr("listAllExternalIds/%s startIndex=%d failed: %s (aborting reconciliation list)", resource, startIndex, e.getMessage());
+                break;
+            }
+        }
+
+        httpInfo("listAllExternalIds/%s complete: %d resources with externalId fetched.", resource, result.size());
+        return result;
+    }
+
+    // -- Shared filter-based id lookup ----------------------------------------
+
     /**
      * Shared filter-based id lookup for both /Users and /Groups.
-     * Replaces the previous Users-only findUserIdByFilter so both resources
-     * use the same retry and logging logic.
      */
     private Optional<String> findEntityIdByFilter(String resource, String attribute, String value, String operation) {
         if (value == null || value.isBlank()) return Optional.empty();
@@ -187,6 +273,8 @@ public class ScimClient {
         }
         return new ScimListResponse(totalResults, Optional.empty(), true);
     }
+
+    // -- User CRUD ------------------------------------------------------------
 
     /** Create SCIM user; returns true on 201/200. */
     public boolean createUser(String jsonPayload) {
@@ -301,7 +389,7 @@ public class ScimClient {
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);
             switch (c) {
-                case '"' -> out.append("\\\"");
+                case '"'  -> out.append("\\\"");
                 case '\\' -> out.append("\\\\");
                 case '\b' -> out.append("\\b");
                 case '\f' -> out.append("\\f");
