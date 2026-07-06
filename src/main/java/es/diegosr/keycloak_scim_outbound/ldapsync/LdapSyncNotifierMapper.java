@@ -150,6 +150,20 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
                 info("MARK NEW_ADDED user=%s target=%s group='%s' (id=%s)",
                         user.getUsername(), target.getName(), groupName, groupId);
 
+            } else if (isMemberNow && existing.isPresent()
+                    && existing.get().state() == MembershipState.State.NEW_DELETED) {
+                // Race: user left (NEW_DELETED written) but rejoined before the sweep processed
+                // the deletion. Cancel the pending deprovision and re-queue an add instead.
+                // The upsert path in ScimMembershipSync is idempotent, so NEW_ADDED is safe even
+                // if the user was already SENT before the leave/rejoin cycle.
+                MembershipState old = existing.get();
+                currentValues.remove(old.toValue());
+                MembershipState newState = new MembershipState(target.getId(), groupId, MembershipState.State.NEW_ADDED);
+                currentValues.add(newState.toValue());
+                changed = true;
+                info("CANCEL NEW_DELETED -> MARK NEW_ADDED user=%s target=%s group='%s' (id=%s) (was %s)",
+                        user.getUsername(), target.getName(), groupName, groupId, old.state());
+
             } else if (!isMemberNow && existing.isPresent()
                     && existing.get().state() != MembershipState.State.NEW_DELETED) {
                 MembershipState old = existing.get();
