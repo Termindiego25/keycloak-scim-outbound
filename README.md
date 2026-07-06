@@ -13,7 +13,7 @@ A lightweight **Keycloak extension** that provisions users and groups to externa
   - `username` → use Keycloak username
   - `email` → use user's email as SCIM `userName`
   - `attribute` → use a custom Keycloak user attribute
-- 🧱 **SCIM v2 compatible** — Works with `/Users`, `/Groups`, and `/ServiceProviderConfig` endpoints.
+- 🧱 **SCIM v2 compatible** — Works with `/Users`, and `/ServiceProviderConfig` endpoints. `/Groups` is not yet supported.
 - 🔒 **Token-based authentication (Bearer)** — no password sync required.
 - 📂 **LDAP/AD support** - Optional [LDAP/AD support](#-optional-ldap--active-directory-integration) via a built-in `LdapSyncNotifierMapper`
 
@@ -184,7 +184,7 @@ During every LDAP sync run, `LdapSyncNotifierMapper` compares each user's curren
 1. Open the **Keycloak Admin Console**.
 2. Go to **User Federation** and select your existing LDAP provider.
 3. Open the **Mappers** tab and click **Add mapper**.
-4. Set **Mapper Type** to `ldap-scim-notifier-mapper` and give it a name (e.g. `SCIM Notifier`).
+4. Set **Mapper Type** to `ldap-scim-notifier` and give it a name (e.g. `SCIM Notifier`).
 5. Save.
 
 ### Mapper ordering — important
