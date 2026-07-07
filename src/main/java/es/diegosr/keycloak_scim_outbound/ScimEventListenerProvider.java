@@ -115,25 +115,16 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                 return;
             }
 
-            // Para cada target SCIM del realm: actuar solo si su filterGroup coincide
+            // Para cada target SCIM del realm
             final List<ComponentModel> targets = realm.getComponentsStream()
                     .filter(c -> ScimTargetProviderFactory.ID.equals(c.getProviderId()))
                     .toList();
 
             for (ComponentModel t : targets) {
-                final String cfgGroup = ScimTargetProviderFactory.get(t, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
-                if (cfgGroup == null || cfgGroup.isBlank() || !cfgGroup.equals(groupName)) continue;
-
                 final String base  = ScimTargetProviderFactory.get(t, ScimTargetProviderFactory.CFG_BASE_URL, null);
                 final String token = ScimTargetProviderFactory.get(t, ScimTargetProviderFactory.CFG_TOKEN, null);
                 if (base == null || token == null) {
                     logErr("SCIM", t.getName(), "Incomplete configuration (baseUrl/token). Skipping membership event.");
-                    continue;
-                }
-
-                final String scimUserName = computeScimUserName(t, user, username);
-                if (scimUserName == null || scimUserName.isBlank()) {
-                    logErr("SCIM", t.getName(), "Cannot resolve SCIM userName for user=%s. Skipping membership event.", username);
                     continue;
                 }
 
@@ -144,25 +135,58 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                 final Long last = debounce.put(debounceKey, now);
                 if (last != null && (now - last) < DEBOUNCE_MS) continue;
 
+                final String scimUserName = computeScimUserName(t, user, username);
+
+                // A) Filter-group user provisioning (comportamiento existente)
+                final String cfgGroup = ScimTargetProviderFactory.get(t, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
+                if (cfgGroup != null && !cfgGroup.isBlank() && cfgGroup.equals(groupName)) {
+                    if (scimUserName == null || scimUserName.isBlank()) {
+                        logErr("SCIM", t.getName(), "Cannot resolve SCIM userName for user=%s. Skipping filter-group event.", username);
+                    } else {
+                        try {
+                            switch (op) {
+                                case CREATE -> { // user ADDED to group
+                                    boolean changed = upsertUser(client, user, scimUserName);
+                                    logInfo("SCIM", t.getName(), "GROUP ADD user=%s group=%s -> %s",
+                                            scimUserName, groupName, changed ? "OK" : "NO-OP");
+                                }
+                                case DELETE -> { // user REMOVED from group
+                                    boolean changed = deprovisionUser(t, client, userId, scimUserName);
+                                    logInfo("SCIM", t.getName(), "GROUP REMOVE user=%s group=%s -> %s",
+                                            scimUserName, groupName, changed ? "OK" : "NO-OP");
+                                }
+                                default -> {}
+                            }
+                        } catch (Exception e) {
+                            logErr("SCIM", t.getName(), "GROUP %s user=%s group=%s ERROR: %s",
+                                    op, scimUserName, groupName, e.getMessage());
+                        }
+                    }
+                }
+
+                // B) Sincronización de miembros en el grupo SCIM
                 try {
-                    switch (op) {
-                        case CREATE -> { // user ADDED to group
-                            boolean changed = upsertUser(client, user, scimUserName);
-                            logInfo("SCIM", t.getName(), "GROUP ADD user=%s group=%s -> %s",
-                                    scimUserName, groupName, changed ? "OK" : "NO-OP");
-                        }
-                        case DELETE -> { // user REMOVED from group
-                            boolean changed = deprovisionUser(t, client, userId, scimUserName);
-                            logInfo("SCIM", t.getName(), "GROUP REMOVE user=%s group=%s -> %s",
-                                    scimUserName, groupName, changed ? "OK" : "NO-OP");
-                        }
-                        default -> {
-                            // ignore UPDATE/others
+                    final Optional<String> scimGroupId = resolveScimGroupId(client, groupId, groupName);
+                    if (scimGroupId.isEmpty()) {
+                        logInfo("SCIM", t.getName(), "MEMBERSHIP %s: grupo SCIM no encontrado (groupId=%s name=%s), omitiendo",
+                                op, groupId, groupName);
+                    } else {
+                        final Optional<String> scimUserId = resolveScimId(client, userId, scimUserName);
+                        if (scimUserId.isEmpty()) {
+                            logInfo("SCIM", t.getName(), "MEMBERSHIP %s: usuario SCIM no encontrado (userId=%s), omitiendo",
+                                    op, userId);
+                        } else {
+                            boolean ok = switch (op) {
+                                case CREATE -> client.patchGroup(scimGroupId.get(), ScimMapper.buildGroupMemberPatch("add", scimUserId.get()));
+                                case DELETE -> client.patchGroup(scimGroupId.get(), ScimMapper.buildGroupMemberPatch("remove", scimUserId.get()));
+                                default -> false;
+                            };
+                            logInfo("SCIM", t.getName(), "MEMBERSHIP %s user=%s group=%s -> %s",
+                                    op, username, groupName, ok ? "OK" : "NO-OP");
                         }
                     }
                 } catch (Exception e) {
-                    logErr("SCIM", t.getName(), "GROUP %s user=%s group=%s ERROR: %s",
-                            op, scimUserName, groupName, e.getMessage());
+                    logErr("SCIM", t.getName(), "MEMBERSHIP %s group=%s ERROR: %s", op, groupName, e.getMessage());
                 }
             }
             return; // membership handled
@@ -185,6 +209,73 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                 case UPDATE -> dispatch("UPDATE", realm, userId, username, user, null);
                 case DELETE -> dispatch("DELETE", realm, userId, username, user, null);
                 default -> { /* ignore */ }
+            }
+        }
+
+        // 3) GROUP CRUD EVENTS
+        if (adminEvent.getResourceType() == ResourceType.GROUP) {
+            final RealmModel realm = session.realms().getRealm(adminEvent.getRealmId());
+            if (realm == null) return;
+
+            final String raw     = adminEvent.getResourcePath();
+            final String path    = (raw != null && !raw.startsWith("/")) ? "/" + raw : raw;
+            final String groupId = extractSegmentAfter(path, "/groups/");
+            if (groupId == null) return;
+
+            final GroupModel    group     = session.groups().getGroupById(realm, groupId);
+            final String        groupName = (group != null) ? group.getName() : null;
+            final OperationType op        = adminEvent.getOperationType();
+
+            final List<ComponentModel> targets = realm.getComponentsStream()
+                    .filter(c -> ScimTargetProviderFactory.ID.equals(c.getProviderId()))
+                    .toList();
+
+            for (ComponentModel t : targets) {
+                final String base  = get(t, CFG_BASE_URL, null);
+                final String token = get(t, CFG_TOKEN, null);
+                if (base == null || token == null) {
+                    logErr("SCIM", t.getName(), "Incomplete configuration (baseUrl/token). Skipping GROUP event.");
+                    continue;
+                }
+                final ScimClient client = new ScimClient(base, token);
+                try {
+                    switch (op) {
+                        case CREATE -> {
+                            if (groupName == null) {
+                                logErr("SCIM", t.getName(), "GROUP CREATE: group not found (id=%s)", groupId);
+                                break;
+                            }
+                            boolean ok = client.createGroup(ScimMapper.buildCreateGroup(groupName, groupId));
+                            logInfo("SCIM", t.getName(), "GROUP CREATE name=%s -> %s", groupName, ok ? "OK" : "CONFLICT/NO-OP");
+                        }
+                        case UPDATE -> {
+                            if (groupName == null) {
+                                logErr("SCIM", t.getName(), "GROUP UPDATE: group not found (id=%s)", groupId);
+                                break;
+                            }
+                            final Optional<String> scimId = resolveScimGroupId(client, groupId, groupName);
+                            if (scimId.isPresent()) {
+                                boolean ok = client.patchGroup(scimId.get(), ScimMapper.buildPatchGroupDisplayName(groupName));
+                                logInfo("SCIM", t.getName(), "GROUP UPDATE name=%s -> %s", groupName, ok ? "OK" : "FAILED");
+                            } else {
+                                boolean ok = client.createGroup(ScimMapper.buildCreateGroup(groupName, groupId));
+                                logInfo("SCIM", t.getName(), "GROUP UPDATE (upsert) name=%s -> %s", groupName, ok ? "OK" : "FAILED");
+                            }
+                        }
+                        case DELETE -> {
+                            final Optional<String> scimId = client.findGroupIdByExternalId(groupId);
+                            if (scimId.isPresent()) {
+                                boolean ok = client.deleteGroup(scimId.get());
+                                logInfo("SCIM", t.getName(), "GROUP DELETE groupId=%s -> %s", groupId, ok ? "OK" : "FAILED");
+                            } else {
+                                logInfo("SCIM", t.getName(), "GROUP DELETE groupId=%s -> NOT FOUND in SCIM", groupId);
+                            }
+                        }
+                        default -> {}
+                    }
+                } catch (Exception e) {
+                    logErr("SCIM", t.getName(), "GROUP %s groupId=%s ERROR: %s", op, groupId, e.getMessage());
+                }
             }
         }
         // other resource types -> ignore
@@ -332,6 +423,17 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                     effectiveMode, id.get(), externalId, scimUserName));
         }
         return ok;
+    }
+
+    /** Prefer externalId lookup; fall back to displayName for groups. */
+    private Optional<String> resolveScimGroupId(ScimClient scim, String externalId, String displayName) {
+        Optional<String> id = (externalId != null && !externalId.isBlank())
+                ? scim.findGroupIdByExternalId(externalId)
+                : Optional.empty();
+        if (id.isEmpty() && displayName != null && !displayName.isBlank()) {
+            id = scim.findGroupIdByDisplayName(displayName);
+        }
+        return id;
     }
 
     /** Prefer externalId lookup; fall back to userName for legacy users without externalId. */

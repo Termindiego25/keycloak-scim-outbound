@@ -82,6 +82,45 @@ public final class ScimMapper {
             """;
     }
 
+    /** Build SCIM Group JSON for POST /Groups. externalId should be the Keycloak group ID. */
+    public static String buildCreateGroup(String displayName, String externalId) {
+        final String name  = esc(nvl(displayName));
+        final String extId = esc(nvl(externalId));
+        return """
+            {
+              "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+              "externalId": "%s",
+              "displayName": "%s"
+            }
+            """.formatted(extId, name);
+    }
+
+    /** Build PatchOp to add or remove a single member from a SCIM group. op: "add" or "remove". */
+    public static String buildGroupMemberPatch(String op, String memberId) {
+        final String escapedId = esc(nvl(memberId));
+        return """
+            {
+              "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+              "Operations": [
+                {"op":"%s","path":"members","value":[{"value":"%s"}]}
+              ]
+            }
+            """.formatted(op, escapedId);
+    }
+
+    /** Build PatchOp to rename a SCIM group (replace displayName). */
+    public static String buildPatchGroupDisplayName(String newDisplayName) {
+        final String name = esc(nvl(newDisplayName));
+        return """
+            {
+              "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+              "Operations": [
+                {"op":"replace","path":"displayName","value":"%s"}
+              ]
+            }
+            """.formatted(name);
+    }
+
     /* ===== helpers ===== */
 
     /** JSON escape for string values. */
