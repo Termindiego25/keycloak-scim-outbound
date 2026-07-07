@@ -87,16 +87,16 @@ public class ScimEventListenerProvider implements EventListenerProvider {
             final RealmModel realm = session.realms().getRealm(adminEvent.getRealmId());
             if (realm == null) return;
 
-            final String raw = adminEvent.getResourcePath(); // e.g. "users/{uid}/groups/{gid}" o "groups/{gid}/members/{uid}"
-            final String path = raw.startsWith("/") ? raw : "/" + raw;  // <-- NORMALIZACIÓN CLAVE
+            final String raw = adminEvent.getResourcePath(); // e.g. "users/{uid}/groups/{gid}" or "groups/{gid}/members/{uid}"
+            final String path = raw.startsWith("/") ? raw : "/" + raw;  // normalize to leading slash
 
-            // Patrones habituales:
+            // Common path patterns:
             //  - /users/{userId}/groups/{groupId}
             //  - /groups/{groupId}/members/{userId}
             String userId  = extractSegmentAfter(path, "/users/");
             String groupId = extractSegmentAfter(path, "/groups/");
 
-            // alternativo "groups/{gid}/members/{uid}"
+            // fallback for "groups/{gid}/members/{uid}"
             if (userId == null)  userId  = extractSegmentAfter(path, "/members/");
             if (groupId == null) groupId = extractSegmentAfter(path, "/groups/");
 
@@ -115,7 +115,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                 return;
             }
 
-            // Para cada target SCIM del realm
+            // For each SCIM target configured in this realm
             final List<ComponentModel> targets = realm.getComponentsStream()
                     .filter(c -> ScimTargetProviderFactory.ID.equals(c.getProviderId()))
                     .toList();
@@ -137,7 +137,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
 
                 final String scimUserName = computeScimUserName(t, user, username);
 
-                // A) Filter-group user provisioning (comportamiento existente)
+                // A) Filter-group user provisioning (existing behavior)
                 final String cfgGroup = ScimTargetProviderFactory.get(t, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
                 if (cfgGroup != null && !cfgGroup.isBlank() && cfgGroup.equals(groupName)) {
                     if (scimUserName == null || scimUserName.isBlank()) {
@@ -164,16 +164,16 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                     }
                 }
 
-                // B) Sincronización de miembros en el grupo SCIM
+                // B) Sync group membership in SCIM
                 try {
                     final Optional<String> scimGroupId = resolveScimGroupId(client, groupId, groupName);
                     if (scimGroupId.isEmpty()) {
-                        logInfo("SCIM", t.getName(), "MEMBERSHIP %s: grupo SCIM no encontrado (groupId=%s name=%s), omitiendo",
+                        logInfo("SCIM", t.getName(), "MEMBERSHIP %s: SCIM group not found (groupId=%s name=%s), skipping",
                                 op, groupId, groupName);
                     } else {
                         final Optional<String> scimUserId = resolveScimId(client, userId, scimUserName);
                         if (scimUserId.isEmpty()) {
-                            logInfo("SCIM", t.getName(), "MEMBERSHIP %s: usuario SCIM no encontrado (userId=%s), omitiendo",
+                            logInfo("SCIM", t.getName(), "MEMBERSHIP %s: SCIM user not found (userId=%s), skipping",
                                     op, userId);
                         } else {
                             boolean ok = switch (op) {
@@ -247,6 +247,29 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                             }
                             boolean ok = client.createGroup(ScimMapper.buildCreateGroup(groupName, groupId));
                             logInfo("SCIM", t.getName(), "GROUP CREATE name=%s -> %s", groupName, ok ? "OK" : "CONFLICT/NO-OP");
+
+                            // Sync existing members into the newly created SCIM group
+                            final Optional<String> scimGrpId = resolveScimGroupId(client, groupId, groupName);
+                            if (scimGrpId.isPresent()) {
+                                final ComponentModel tFinal = t;
+                                session.users().getGroupMembersStream(realm, group).forEach(member -> {
+                                    try {
+                                        final String scimUname = computeScimUserName(tFinal, member, member.getUsername());
+                                        if (scimUname == null || scimUname.isBlank()) return;
+                                        upsertUser(client, member, scimUname);
+                                        resolveScimId(client, member.getId(), scimUname).ifPresent(uid -> {
+                                            boolean added = client.patchGroup(scimGrpId.get(),
+                                                    ScimMapper.buildGroupMemberPatch("add", uid));
+                                            logInfo("SCIM", tFinal.getName(),
+                                                    "GROUP CREATE member=%s -> %s", scimUname, added ? "OK" : "NO-OP");
+                                        });
+                                    } catch (Exception e) {
+                                        logErr("SCIM", tFinal.getName(),
+                                                "GROUP CREATE member sync error user=%s: %s",
+                                                member.getUsername(), e.getMessage());
+                                    }
+                                });
+                            }
                         }
                         case UPDATE -> {
                             if (groupName == null) {
