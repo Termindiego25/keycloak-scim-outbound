@@ -2,25 +2,20 @@ package es.diegosr.keycloak_scim_outbound.ui;
 
 import org.keycloak.component.ComponentModel;
 import org.keycloak.component.ComponentValidationException;
-import org.keycloak.component.SubComponentFactory;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.KeycloakSessionFactory;
 import org.keycloak.models.RealmModel;
 import org.keycloak.provider.ProviderConfigProperty;
-import org.keycloak.storage.UserStorageProvider;
 import org.keycloak.storage.UserStorageProviderFactory;
 
-import java.util.ArrayList;
 import java.util.List;
-import java.util.stream.Collectors;
 
 /**
  * UI-configurable provider (shows up under: Realm → User Federation → Add provider).
  * This does not store users; it only holds SCIM target configuration so the event listener
  * can read it and push SCIM operations accordingly.
  */
-public class ScimTargetProviderFactory implements UserStorageProviderFactory<ScimTargetProvider>,
-        SubComponentFactory<ScimTargetProvider, UserStorageProvider> {
+public class ScimTargetProviderFactory implements UserStorageProviderFactory<ScimTargetProvider> {
 
     /** Stable provider id shown in the “Add provider” list. Keep this in sync with the listener lookup. */
     public static final String ID = "keycloak-scim-outbound";
@@ -59,8 +54,7 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
         return p;
     }
 
-    // Base props without syncGroupsFilter (added dynamically in getConfigProperties overrides)
-    private static final List<ProviderConfigProperty> STATIC_PROPS = List.of(
+    private static final List<ProviderConfigProperty> PROPS = List.of(
         prop(ProviderConfigProperty.STRING_TYPE,  CFG_BASE_URL,
             "SCIM Base URL (e.g. https://app.example.com/scim/v2).", true, "SCIM Base URL"),
         prop(ProviderConfigProperty.PASSWORD,     CFG_TOKEN,
@@ -75,49 +69,21 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
             "User attribute name to read when 'userNameStrategy=attribute' (e.g. scim_username).", false, "UserName Attribute"),
 
         list("Deprovisioning behavior when a user is deleted or removed from the filter group: "
-            + "'deactivate' (PATCH active=false, default) or 'delete' (DELETE /Users/{id}, e.g. for vCenter).",
+            + "'deactivate' (PATCH active=false, default) or 'delete' (DELETE /Users/{id}).",
             CFG_DEPROVISION, List.of("deactivate","delete"), "deactivate", true),
 
         prop(ProviderConfigProperty.BOOLEAN_TYPE, CFG_SYNC_GROUPS,
-            "Enable SCIM /Groups sync. When true, Keycloak group create/update/delete and membership changes "
-            + "are pushed to SCIM /Groups. Disabled by default.", false, "Sync Groups")
+            "Enable SCIM /Groups sync. When true, group create/update/delete and membership changes "
+            + "are pushed to SCIM /Groups. Disabled by default.", false, "Sync Groups"),
+
+        prop(ProviderConfigProperty.STRING_TYPE, CFG_SYNC_GROUPS_FILTER,
+            "Group names to sync, separated by commas (e.g. admins,developers). Leave empty to sync all groups. Only used when Sync Groups is enabled.",
+            false, "Sync Groups Filter")
     );
 
-    /**
-     * Static fallback (no realm context): syncGroupsFilter is a plain string.
-     * In practice, Keycloak's Admin UI always calls the realm-aware override below.
-     */
     @Override
     public List<ProviderConfigProperty> getConfigProperties() {
-        List<ProviderConfigProperty> all = new ArrayList<>(STATIC_PROPS);
-        all.add(prop(ProviderConfigProperty.STRING_TYPE, CFG_SYNC_GROUPS_FILTER,
-            "Comma-separated group names to sync. Leave blank to sync all groups. Only used when Sync Groups is enabled.",
-            false, "Sync Groups Filter"));
-        return all;
-    }
-
-    /**
-     * Realm-aware override (SubComponentFactory): syncGroupsFilter becomes a multi-select
-     * dropdown populated with the actual groups from the realm.
-     */
-    @Override
-    public List<ProviderConfigProperty> getConfigProperties(RealmModel realm, ComponentModel parent) {
-        List<String> groupNames = realm.getGroupsStream()
-                .map(g -> g.getName())
-                .sorted()
-                .collect(Collectors.toList());
-
-        ProviderConfigProperty filterProp = new ProviderConfigProperty();
-        filterProp.setType(ProviderConfigProperty.MULTIVALUED_LIST_TYPE);
-        filterProp.setName(CFG_SYNC_GROUPS_FILTER);
-        filterProp.setLabel("Sync Groups Filter");
-        filterProp.setHelpText("Select which groups to sync. Leave empty to sync all groups. Only used when Sync Groups is enabled.");
-        filterProp.setOptions(groupNames);
-        filterProp.setRequired(false);
-
-        List<ProviderConfigProperty> all = new ArrayList<>(STATIC_PROPS);
-        all.add(filterProp);
-        return all;
+        return PROPS;
     }
 
     @Override
@@ -166,23 +132,19 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
             throw new ComponentValidationException("Invalid deprovisionAction. Use 'deactivate' or 'delete'.");
         }
 
-        // Validate that every group in syncGroupsFilter exists in the realm
-        List<String> groupEntries = model.getConfig().get(CFG_SYNC_GROUPS_FILTER);
-        if (groupEntries != null && !groupEntries.isEmpty()) {
-            for (String raw : groupEntries) {
-                if (raw == null) continue;
-                // Each entry may be a single name (MULTIVALUED_LIST_TYPE) or comma-separated (fallback)
-                for (String name : raw.split(",")) {
-                    name = name.trim();
-                    if (name.isEmpty()) continue;
-                    final String n = name;
-                    boolean found = session.groups()
-                            .searchForGroupByNameStream(realm, n, true, 0, 1)
-                            .anyMatch(g -> g.getName().equalsIgnoreCase(n));
-                    if (!found) {
-                        throw new ComponentValidationException(
-                                "Sync Groups Filter: group '" + n + "' does not exist in realm '" + realm.getName() + "'.");
-                    }
+        // Validate that every group name in syncGroupsFilter exists in the realm
+        String groupsFilter = get(model, CFG_SYNC_GROUPS_FILTER, null);
+        if (groupsFilter != null && !groupsFilter.isBlank()) {
+            for (String raw : groupsFilter.split(",")) {
+                String name = raw.trim();
+                if (name.isEmpty()) continue;
+                final String n = name;
+                boolean found = session.groups()
+                        .searchForGroupByNameStream(realm, n, true, 0, 1)
+                        .anyMatch(g -> g.getName().equalsIgnoreCase(n));
+                if (!found) {
+                    throw new ComponentValidationException(
+                            "Sync Groups Filter: group '" + n + "' does not exist in realm '" + realm.getName() + "'.");
                 }
             }
         }

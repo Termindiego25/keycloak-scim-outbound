@@ -437,15 +437,11 @@ public class ScimEventListenerProvider implements EventListenerProvider {
      * groupName=null always passes so that DELETE events (where the group is already gone) are attempted.
      */
     private boolean isGroupAllowedForSync(ComponentModel t, String groupName) {
-        List<String> allowed = t.getConfig().get(CFG_SYNC_GROUPS_FILTER);
-        if (allowed == null || allowed.isEmpty()) return true;
+        String filter = get(t, CFG_SYNC_GROUPS_FILTER, null);
+        if (filter == null || filter.isBlank()) return true;
         if (groupName == null) return true;
-        for (String entry : allowed) {
-            if (entry == null) continue;
-            // Each entry is a single name (MULTIVALUED_LIST_TYPE) or comma-separated (STRING_TYPE fallback)
-            for (String name : entry.split(",")) {
-                if (name.trim().equalsIgnoreCase(groupName)) return true;
-            }
+        for (String name : filter.split(",")) {
+            if (name.trim().equalsIgnoreCase(groupName)) return true;
         }
         return false;
     }
