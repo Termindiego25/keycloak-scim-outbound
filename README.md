@@ -184,7 +184,7 @@ During every LDAP sync run, `LdapSyncNotifierMapper` compares each user's curren
 1. Open the **Keycloak Admin Console**.
 2. Go to **User Federation** and select your existing LDAP provider.
 3. Open the **Mappers** tab and click **Add mapper**.
-4. Set **Mapper Type** to `ldap-scim-notifier` and give it a name (e.g. `SCIM Notifier`).
+4. Set **Mapper Type** to `ldap-sync-notifier` and give it a name (e.g. `SCIM Notifier`).
 5. Save.
 
 ### Mapper ordering — important
