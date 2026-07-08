@@ -188,11 +188,6 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
         }
     }
 
-    @Override
-    public List<ProviderConfigProperty> getConfigProperties() {
-        return PROPS;
-    }
-
     /* ===== Helpers ===== */
 
     private static ProviderConfigProperty prop(String type, String name, String help,
