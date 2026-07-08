@@ -95,17 +95,32 @@ public final class ScimMapper {
             """.formatted(extId, name);
     }
 
-    /** Build PatchOp to add or remove a single member from a SCIM group. op: "add" or "remove". */
+    /**
+     * Build PatchOp to add a member to a SCIM group.
+     * Uses the standard path+value form: {"op":"add","path":"members","value":[{"value":"id"}]}
+     */
     public static String buildGroupMemberPatch(String op, String memberId) {
         final String escapedId = esc(nvl(memberId));
+        if ("remove".equals(op)) {
+            // RFC 7644 §3.5.2: for remove, use the path-filter form for better interoperability.
+            // {"op":"remove","path":"members[value eq \"id\"]"}  (no value array)
+            return "{\n"
+                 + "  \"schemas\": [\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\n"
+                 + "  \"Operations\": [\n"
+                 + "    {\"op\":\"remove\",\"path\":\"members[value eq \\\""
+                 + escapedId
+                 + "\\\"]\"}\n"
+                 + "  ]\n"
+                 + "}\n";
+        }
         return """
             {
               "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
               "Operations": [
-                {"op":"%s","path":"members","value":[{"value":"%s"}]}
+                {"op":"add","path":"members","value":[{"value":"%s"}]}
               ]
             }
-            """.formatted(op, escapedId);
+            """.formatted(escapedId);
     }
 
     /** Build PatchOp to rename a SCIM group (replace displayName). */
