@@ -439,9 +439,13 @@ public class ScimEventListenerProvider implements EventListenerProvider {
     private boolean isGroupAllowedForSync(ComponentModel t, String groupName) {
         List<String> allowed = t.getConfig().get(CFG_SYNC_GROUPS_FILTER);
         if (allowed == null || allowed.isEmpty()) return true;
-        if (groupName == null) return true; // can't filter without name; let DELETE attempt proceed
-        for (String name : allowed) {
-            if (name != null && name.trim().equalsIgnoreCase(groupName)) return true;
+        if (groupName == null) return true;
+        for (String entry : allowed) {
+            if (entry == null) continue;
+            // Each entry is a single name (MULTIVALUED_LIST_TYPE) or comma-separated (STRING_TYPE fallback)
+            for (String name : entry.split(",")) {
+                if (name.trim().equalsIgnoreCase(groupName)) return true;
+            }
         }
         return false;
     }

@@ -73,7 +73,7 @@ Once deployed:
 | **userName Attribute**      | Custom user attribute name (only if strategy = `attribute`)           | ❌        |
 | **Deprovision Action**      | What to do on delete / group removal: `deactivate` (PATCH `active=false`, default) or `delete` (`DELETE /Users/{id}`) | ✅        |
 | **Sync Groups**             | Enable SCIM `/Groups` sync. When `true`, group create/rename/delete and membership changes are pushed to the SCIM target. **Disabled by default.** | ❌        |
-| **Sync Groups Filter**      | List of group names to sync. Add each group individually. Leave empty to sync **all** groups. Only used when *Sync Groups* is enabled. | ❌        |
+| **Sync Groups Filter**      | Comma-separated list of group names to sync (e.g. `admins,developers`). Leave blank to sync **all** groups. Names are validated against the realm on save. Only used when *Sync Groups* is enabled. | ❌        |
 
 ---
 
@@ -102,7 +102,7 @@ Group sync is **opt-in** and disabled by default to avoid affecting existing dep
 In the provider configuration (*User Federation → keycloak-scim-outbound*):
 
 1. Toggle **Sync Groups** to `true`.
-2. Optionally, use **Sync Groups Filter** to add the specific group names you want to sync. Each group name is added individually and appears as a removable tag — leave it empty to sync all groups.
+2. Optionally, fill **Sync Groups Filter** with the group names you want to sync, separated by commas (e.g. `admins,developers`). Leave it blank to sync all groups. Keycloak will reject names that do not exist in the realm when you save.
 3. Save.
 
 ### What gets synced
