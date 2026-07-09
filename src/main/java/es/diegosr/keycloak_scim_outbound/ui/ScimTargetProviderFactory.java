@@ -33,6 +33,15 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
     /** Deprovisioning behavior on delete / group removal: deactivate | delete */
     public static final String CFG_DEPROVISION    = "deprovisionAction";
 
+    /** Enable SCIM /Groups sync. Disabled by default to avoid breaking existing deployments. */
+    public static final String CFG_SYNC_GROUPS        = "syncGroups";
+
+    /**
+     * Optional comma-separated list of Keycloak group names to sync (e.g. "admins,developers").
+     * When blank, all groups are synced. Only meaningful when CFG_SYNC_GROUPS is true.
+     */
+    public static final String CFG_SYNC_GROUPS_FILTER = "syncGroupsFilter";
+
     private static ProviderConfigProperty list(String help, String name, List<String> options, String def, boolean required) {
         ProviderConfigProperty p = new ProviderConfigProperty();
         p.setType(ProviderConfigProperty.LIST_TYPE);
@@ -60,9 +69,22 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
             "User attribute name to read when 'userNameStrategy=attribute' (e.g. scim_username).", false, "UserName Attribute"),
 
         list("Deprovisioning behavior when a user is deleted or removed from the filter group: "
-            + "'deactivate' (PATCH active=false, default) or 'delete' (DELETE /Users/{id}, e.g. for vCenter).",
-            CFG_DEPROVISION, List.of("deactivate","delete"), "deactivate", true)
+            + "'deactivate' (PATCH active=false, default) or 'delete' (DELETE /Users/{id}).",
+            CFG_DEPROVISION, List.of("deactivate","delete"), "deactivate", true),
+
+        prop(ProviderConfigProperty.BOOLEAN_TYPE, CFG_SYNC_GROUPS,
+            "Enable SCIM /Groups sync. When true, group create/update/delete and membership changes "
+            + "are pushed to SCIM /Groups. Disabled by default.", false, "Sync Groups"),
+
+        prop(ProviderConfigProperty.STRING_TYPE, CFG_SYNC_GROUPS_FILTER,
+            "Group names to sync, separated by commas (e.g. admins,developers). Leave empty to sync all groups. Only used when Sync Groups is enabled.",
+            false, "Sync Groups Filter")
     );
+
+    @Override
+    public List<ProviderConfigProperty> getConfigProperties() {
+        return PROPS;
+    }
 
     @Override
     public ScimTargetProvider create(KeycloakSession session, ComponentModel model) {
@@ -109,11 +131,23 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
         if (!"deactivate".equals(deprovision) && !"delete".equals(deprovision)) {
             throw new ComponentValidationException("Invalid deprovisionAction. Use 'deactivate' or 'delete'.");
         }
-    }
 
-    @Override
-    public List<ProviderConfigProperty> getConfigProperties() {
-        return PROPS;
+        // Validate that every group name in syncGroupsFilter exists in the realm
+        String groupsFilter = get(model, CFG_SYNC_GROUPS_FILTER, null);
+        if (groupsFilter != null && !groupsFilter.isBlank()) {
+            for (String raw : groupsFilter.split(",")) {
+                String name = raw.trim();
+                if (name.isEmpty()) continue;
+                final String n = name;
+                boolean found = session.groups()
+                        .searchForGroupByNameStream(realm, n, true, 0, 1)
+                        .anyMatch(g -> g.getName().equalsIgnoreCase(n));
+                if (!found) {
+                    throw new ComponentValidationException(
+                            "Sync Groups Filter: group '" + n + "' does not exist in realm '" + realm.getName() + "'.");
+                }
+            }
+        }
     }
 
     /* ===== Helpers ===== */
