@@ -16,6 +16,7 @@ A lightweight **Keycloak extension** that provisions users and groups to externa
 - 🧱 **SCIM v2 compatible** — Works with `/Users`, and `/ServiceProviderConfig` endpoints. `/Groups` is not yet supported.
 - 🔒 **Token-based authentication (Bearer)** — no password sync required.
 - 📂 **LDAP/AD support** - Optional [LDAP/AD support](#-optional-ldap--active-directory-integration) via a built-in `LdapSyncNotifierMapper`
+- 🗂️ **Optional SCIM Group sync** — Push Keycloak group create/rename/delete and membership changes to SCIM `/Groups`. Opt-in, disabled by default; this feature does not yet support LDAP.
 
 ---
 
@@ -65,12 +66,14 @@ Once deployed:
 
 | Field | Description | Required |
 | --------------------------- | --------------------------------------------------------------------- | -------- |
-| **SCIM Base URL** | Base endpoint of your SCIM API, e.g. `https://app.example.com/scim/v2` | ✅ |
-| **SCIM Token** | Bearer token for authenticating with the SCIM target | ✅ |
-| **Filter Group (optional)** | Only users in this group will be provisioned | ❌ |
-| **userName Strategy** | How to build SCIM `userName` (`username`, `email`, or `attribute`) | ✅ |
-| **userName Attribute** | Custom user attribute name (only if strategy = `attribute`) | ❌ |
-| **Deprovision Action** | What to do on delete / group removal: `deactivate` (PATCH `active=false`, default) or `delete` (`DELETE /Users/{id}`) | ✅ |
+| **SCIM Base URL**           | Base endpoint of your SCIM API, e.g. `https://app.example.com/scim/v2` | ✅        |
+| **SCIM Token**              | Bearer token for authenticating with the SCIM target                  | ✅        |
+| **Filter Group (optional)** | Only users in this group will be provisioned                          | ❌        |
+| **userName Strategy**       | How to build SCIM `userName` (`username`, `email`, or `attribute`)    | ✅        |
+| **userName Attribute**      | Custom user attribute name (only if strategy = `attribute`)           | ❌        |
+| **Deprovision Action**      | What to do on delete / group removal: `deactivate` (PATCH `active=false`, default) or `delete` (`DELETE /Users/{id}`) | ✅        |
+| **Sync Groups**             | Enable SCIM `/Groups` sync. When `true`, group create/rename/delete and membership changes are pushed to the SCIM target. **Disabled by default.** | ❌        |
+| **Sync Groups Filter**      | Comma-separated list of group names to sync (e.g. `admins,developers`). Leave blank to sync **all** groups. Names are validated against the realm on save. Only used when *Sync Groups* is enabled. | ❌        |
 
 ---
 
@@ -78,14 +81,52 @@ Once deployed:
 
 | Event | Action |
 | --------------------------------- | ------------------------------------------------------------------------------- |
-| **REGISTER** | Create new SCIM user |
-| **UPDATE_PROFILE / UPDATE_EMAIL** | Update SCIM user fields |
-| **UPDATE_CREDENTIAL (password)** | Patch password if supported |
-| **DELETE_ACCOUNT** | Deprovision SCIM user (deactivate or delete, per *Deprovision Action*) |
-| **Admin CREATE/UPDATE/DELETE** | Sync CRUD operations |
-| **Group membership add/remove** | Provision/deprovision users based on group membership (if `filterGroup` is set) |
+| **REGISTER**                      | Create new SCIM user                                                            |
+| **UPDATE_PROFILE / UPDATE_EMAIL** | Update SCIM user fields                                                         |
+| **UPDATE_CREDENTIAL (password)**  | Patch password if supported                                                     |
+| **DELETE_ACCOUNT**                | Deprovision SCIM user (deactivate or delete, per *Deprovision Action*)          |
+| **Admin CREATE/UPDATE/DELETE**    | Sync CRUD operations                                                            |
+| **Group membership add/remove**   | Provision/deprovision users based on group membership (if `filterGroup` is set); also updates SCIM group member list (if `Sync Groups` is enabled) |
+| **Group CREATE/UPDATE/DELETE**    | Create, rename, or delete the corresponding SCIM group (only if `Sync Groups` is enabled) |
 
 > ℹ️ **Lifecycle lookup & deprovisioning:** users are matched by SCIM `externalId` (the Keycloak user id) first, falling back to `userName` for users provisioned before `externalId` existed. The `externalId` is also backfilled on update for legacy users. Deprovisioning defaults to **deactivate** (`PATCH active=false`); set *Deprovision Action* to `delete` for providers that require a hard delete (e.g. VMware vCenter).
+
+---
+
+## 🗂️ SCIM Group Sync
+
+Group sync is **opt-in** and disabled by default to avoid affecting existing deployments on SCIM targets that do not support `/Groups`.
+
+### How to enable
+
+In the provider configuration (*User Federation → keycloak-scim-outbound*):
+
+1. Toggle **Sync Groups** to `true`.
+2. Optionally, fill **Sync Groups Filter** with the group names you want to sync, separated by commas (e.g. `admins,developers`). Leave it blank to sync all groups. Keycloak will reject names that do not exist in the realm when you save.
+3. Save.
+
+### What gets synced
+
+| Keycloak event | SCIM operation |
+|---|---|
+| Group created | `POST /Groups` — creates an empty group with `externalId` = Keycloak group UUID and `displayName` = group name |
+| Group renamed | `PATCH /Groups/{id}` — updates `displayName` |
+| Group deleted | `DELETE /Groups/{id}` — found by `externalId` (stable, even after deletion) |
+| User added to group | `PATCH /Groups/{id}` — adds the user as a member (`op: add`) |
+| User removed from group | `PATCH /Groups/{id}` — removes the member using the SCIM path-filter form: `members[value eq "<userId>"]` (RFC 7644 §3.5.2) |
+
+Groups are matched in SCIM by `externalId` (Keycloak UUID) first, falling back to `displayName`. The `externalId` is set at creation time, so renames do not break the link.
+
+### Provisioning scope
+
+Membership updates in SCIM only apply to **users that are already provisioned**. If a user was never pushed to the SCIM target (e.g. because they are outside the configured `Filter Group`), they will not have a SCIM id and will be silently skipped when updating group membership. No unintended users are created.
+
+### Limitations
+
+- **No initial full-sync**: enabling *Sync Groups* does not retroactively push existing groups or their current members. Only events that happen *after* enabling will be processed. To seed existing groups, trigger a group update or re-create them.
+- **Permissions are not assigned**: creating a group via SCIM does not automatically grant it any permissions in the target system. Permission assignment must be done manually in the target after the group is created.
+- **Top-level groups only**: nested Keycloak sub-groups fire the same `GROUP` events and are synced as flat groups in SCIM (SCIM v2 Groups do not have a native hierarchy).
+- **Target must support `/Groups`**: not all SCIM implementations expose the Groups resource. Check your target's documentation or `ServiceProviderConfig` before enabling.
 
 ---
 
@@ -115,9 +156,9 @@ kc.sh start --log-level=org.keycloak.events=DEBUG,es.diegosr.keycloak_scim_outbo
 
 | Target | Base URL | Notes |
 | -------------- | -------------------------------------------------- | -------------------------- |
-| **Passbolt** | `https://your-passbolt-domain/scim/v2` | Works out of the box |
-| **Nextcloud** | `https://cloud.example.com/apps/user_saml/scim/v2` | Requires SCIM app enabled |
-| **Custom app** | Any compliant SCIM v2 endpoint | Supports `/Users` resource |
+| **Passbolt**   | `https://your-passbolt-domain/scim/v2`             | Works out of the box       |
+| **Nextcloud**  | `https://cloud.example.com/apps/user_saml/scim/v2` | Requires SCIM app enabled  |
+| **Custom app** | Any compliant SCIM v2 endpoint                     | Supports `/Users` and `/Groups` resources |
 
 ---
 

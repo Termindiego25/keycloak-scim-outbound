@@ -149,6 +149,79 @@ public class ScimClient {
         }
     }
 
+    /* ======================= Groups ======================= */
+
+    /** Find group by displayName and return SCIM id if present. */
+    public Optional<String> findGroupIdByDisplayName(String displayName) {
+        return findGroupIdByFilter("displayName", displayName, "findGroupIdByDisplayName");
+    }
+
+    /** Find group by externalId and return SCIM id if present. */
+    public Optional<String> findGroupIdByExternalId(String externalId) {
+        return findGroupIdByFilter("externalId", externalId, "findGroupIdByExternalId");
+    }
+
+    private Optional<String> findGroupIdByFilter(String attribute, String value, String operation) {
+        if (value == null || value.isBlank()) return Optional.empty();
+        try {
+            String filter = attribute + " eq " + scimFilterString(value);
+            String query = "filter=" + urlEncode(filter);
+            HttpRequest req = baseRequestBuilder("/Groups?" + query).GET().build();
+            HttpResponse<String> res = sendWithRetries(req);
+            if (is2xx(res.statusCode())) {
+                ScimListResponse groups = parseListResponse(res.body());
+                httpInfo("GET /Groups?%s -> %d totalResults=%d", query, res.statusCode(), groups.totalResults());
+                return groups.firstId();
+            } else {
+                httpErr("GET /Groups?%s -> %d %s", query, res.statusCode(), safeBody(res));
+            }
+        } catch (Exception e) {
+            httpErr("%s failed: %s", operation, e.getMessage());
+        }
+        return Optional.empty();
+    }
+
+    /** Create SCIM group; returns true on 201/200. */
+    public boolean createGroup(String jsonPayload) {
+        try {
+            HttpRequest req = baseRequestBuilder("/Groups")
+                    .header("Content-Type", "application/scim+json")
+                    .POST(HttpRequest.BodyPublishers.ofString(jsonPayload))
+                    .build();
+            HttpResponse<String> res = sendWithRetries(req);
+            if (res.statusCode() == 201 || res.statusCode() == 200) return true;
+            if (res.statusCode() == 409) {
+                httpInfo("POST /Groups got 409 conflict: %s", safeBody(res));
+            } else {
+                httpErr("POST /Groups -> %d %s", res.statusCode(), safeBody(res));
+            }
+            return false;
+        } catch (Exception e) {
+            httpErr("POST /Groups failed: %s", e.getMessage());
+            return false;
+        }
+    }
+
+    /** Patch SCIM group by id (RFC 7644 PatchOp). */
+    public boolean patchGroup(String id, String jsonPatch) {
+        return sendJson("PATCH", groupPath(id), jsonPatch, 200, 204);
+    }
+
+    /** Delete SCIM group by id. */
+    public boolean deleteGroup(String id) {
+        String path = groupPath(id);
+        try {
+            HttpRequest req = baseRequestBuilder(path).DELETE().build();
+            HttpResponse<String> res = sendWithRetries(req);
+            boolean ok = res.statusCode() == 204 || res.statusCode() == 200 || res.statusCode() == 404;
+            if (!ok) httpErr("DELETE %s -> %d %s", path, res.statusCode(), safeBody(res));
+            return ok;
+        } catch (Exception e) {
+            httpErr("DELETE %s failed: %s", path, e.getMessage());
+            return false;
+        }
+    }
+
     /* ======================= internals ======================= */
 
     private boolean sendJson(String method, String path, String json, int... okCodes) {
@@ -209,7 +282,8 @@ public class ScimClient {
     private static boolean is2xx(int code) { return code >= 200 && code < 300; }
     private static boolean matches(int code, int... okCodes) { for (int ok : okCodes) if (ok == code) return true; return false; }
     private static String trimTrailingSlash(String s) { if (s == null || s.isEmpty()) return s; return s.endsWith("/") ? s.substring(0, s.length() - 1) : s; }
-    private static String userPath(String id) { return "/Users/" + urlEncode(id); }
+    private static String userPath(String id)  { return "/Users/"  + urlEncode(id); }
+    private static String groupPath(String id) { return "/Groups/" + urlEncode(id); }
     private static String urlEncode(String s) { return URLEncoder.encode(s, StandardCharsets.UTF_8).replace("+", "%20"); }
     private static void sleep(long ms) { try { Thread.sleep(ms); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); } }
     private static String safeBody(HttpResponse<String> res) { String b = res.body(); return b == null ? "" : (b.length() > 400 ? b.substring(0, 400) + " …" : b); }
