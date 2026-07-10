@@ -13,7 +13,7 @@ A lightweight **Keycloak extension** that provisions users and groups to externa
   - `username` → use Keycloak username
   - `email` → use user's email as SCIM `userName`
   - `attribute` → use a custom Keycloak user attribute
-- 🧱 **SCIM v2 compatible** — Works with `/Users`, and `/ServiceProviderConfig` endpoints. `/Groups` is not yet supported.
+- 🧱 **SCIM v2 compatible** — Works with `/Users`, optional `/Groups` sync, and `/ServiceProviderConfig` endpoints.
 - 🔒 **Token-based authentication (Bearer)** — no password sync required.
 - 📂 **LDAP/AD support** - Optional [LDAP/AD support](#-optional-ldap--active-directory-integration) via a built-in `LdapSyncNotifierMapper`
 - 🗂️ **Optional SCIM Group sync** — Push Keycloak group create/rename/delete and membership changes to SCIM `/Groups`. Opt-in, disabled by default; this feature does not yet support LDAP.
