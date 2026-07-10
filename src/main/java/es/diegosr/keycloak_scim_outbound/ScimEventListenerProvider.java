@@ -432,18 +432,29 @@ public class ScimEventListenerProvider implements EventListenerProvider {
 
     /**
      * Returns true if the group should be synced for this target.
-     * When CFG_SYNC_GROUPS_FILTER is empty, all groups pass.
-     * When it contains entries, only matching groups (case-insensitive) pass.
-     * groupName=null always passes so that DELETE events (where the group is already gone) are attempted.
+     *
+     * When CFG_SYNC_GROUPS_FILTER is blank: only the group named by CFG_FILTER_GROUP is in scope.
+     * When CFG_SYNC_GROUPS_FILTER is set: the group name must match the Java regex.
+     * groupName=null: returns true only when filter is set (so that DELETE events where the
+     * group is already gone can still be attempted by regex-configured targets), and false
+     * for the blank-filter case (no name to match against CFG_FILTER_GROUP).
      */
     private boolean isGroupAllowedForSync(ComponentModel t, String groupName) {
         String filter = get(t, CFG_SYNC_GROUPS_FILTER, null);
-        if (filter == null || filter.isBlank()) return true;
-        if (groupName == null) return true;
-        for (String name : filter.split(",")) {
-            if (name.trim().equalsIgnoreCase(groupName)) return true;
+        if (filter == null || filter.isBlank()) {
+            // No regex: only the CFG_FILTER_GROUP is in scope
+            if (groupName == null) return false;
+            String filterGroup = get(t, CFG_FILTER_GROUP, null);
+            return groupName.equals(filterGroup);
         }
-        return false;
+        // Regex filter: null groupName passes so DELETE events are not silently dropped
+        if (groupName == null) return true;
+        try {
+            return groupName.matches(filter);
+        } catch (java.util.regex.PatternSyntaxException e) {
+            logErr("SCIM", t.getName(), "Invalid CFG_SYNC_GROUPS_FILTER regex '%s': %s", filter, e.getMessage());
+            return false;
+        }
     }
 
     /** Prefer externalId lookup; fall back to displayName for groups. */
