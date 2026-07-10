@@ -2,6 +2,8 @@ package es.diegosr.keycloak_scim_outbound.util;
 
 import org.keycloak.models.UserModel;
 
+import java.util.List;
+
 /**
  * Builds SCIM v2 User payloads from Keycloak's UserModel.
  * Keep all string escaping / normalization here.
@@ -96,20 +98,21 @@ public final class ScimMapper {
     }
 
     /**
-     * Build PatchOp to add a member to a SCIM group.
-     * Uses the standard path+value form: {"op":"add","path":"members","value":[{"value":"id"}]}
+     * Build PatchOp to add or remove a single member from a SCIM group.
+     * Uses the standard path+value form for "add":
+     *   {"op":"add","path":"members","value":[{"value":"id"}]}
+     * Uses the path-filter form for "remove" (better interoperability per RFC 7644 ss3.5.2):
+     *   {"op":"remove","path":"members[value eq \"id\"]"}
      */
     public static String buildGroupMemberPatch(String op, String memberId) {
         final String escapedId = esc(nvl(memberId));
         if ("remove".equals(op)) {
-            // RFC 7644 §3.5.2: for remove, use the path-filter form for better interoperability.
-            // {"op":"remove","path":"members[value eq \"id\"]"}  (no value array)
             return "{\n"
                  + "  \"schemas\": [\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\n"
                  + "  \"Operations\": [\n"
                  + "    {\"op\":\"remove\",\"path\":\"members[value eq \\\""
                  + escapedId
-                 + "\\\"]\"}\n"
+                 + "\\\"]\"}\\n"
                  + "  ]\n"
                  + "}\n";
         }
@@ -121,6 +124,33 @@ public final class ScimMapper {
               ]
             }
             """.formatted(escapedId);
+    }
+
+    /**
+     * Builds a SCIM PATCH request body that replaces the entire members list of a group
+     * with the provided set of SCIM user IDs. Uses op=replace on the members attribute.
+     * RFC 7644 ss3.5.2.
+     *
+     * An empty scimUserIds list produces a replace with an empty array (clears all members).
+     *
+     * @param scimUserIds list of SCIM user IDs (the "value" field of each member entry)
+     */
+    public static String buildGroupMemberReplace(List<String> scimUserIds) {
+        StringBuilder valueArray = new StringBuilder("[");
+        if (scimUserIds != null && !scimUserIds.isEmpty()) {
+            for (int i = 0; i < scimUserIds.size(); i++) {
+                if (i > 0) valueArray.append(",");
+                valueArray.append("{\"value\":\"").append(esc(nvl(scimUserIds.get(i)))).append("\"}");
+            }
+        }
+        valueArray.append("]");
+
+        return "{\n"
+             + "  \"schemas\": [\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\n"
+             + "  \"Operations\": [\n"
+             + "    {\"op\":\"replace\",\"path\":\"members\",\"value\":" + valueArray + "}\n"
+             + "  ]\n"
+             + "}\n";
     }
 
     /** Build PatchOp to rename a SCIM group (replace displayName). */
@@ -145,7 +175,7 @@ public final class ScimMapper {
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);
             switch (c) {
-                case '"' -> out.append("\\\"");
+                case '"'  -> out.append("\\\"");
                 case '\\' -> out.append("\\\\");
                 case '\b' -> out.append("\\b");
                 case '\f' -> out.append("\\f");
