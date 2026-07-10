@@ -1,5 +1,6 @@
 package es.diegosr.keycloak_scim_outbound.ui;
 
+import es.diegosr.keycloak_scim_outbound.ldapsync.ScimGroupSync;
 import es.diegosr.keycloak_scim_outbound.ldapsync.ScimMembershipSync;
 
 import org.keycloak.component.ComponentModel;
@@ -24,8 +25,18 @@ import java.util.List;
  *
  * Implements ImportSynchronization so that clicking "Synchronize all users" /
  * "Synchronize changed users" on this provider's page in the admin console triggers
- * an immediate sweep of pending LDAP-driven membership changes for THIS target only,
- * instead of waiting for the next 5-minute timer tick.
+ * an immediate sweep of pending LDAP-driven membership changes for THIS target only.
+ *
+ * Sync execution order (critical invariant):
+ *   Step 1 -- User sync (always before group sync, so SCIM user IDs exist by the time
+ *              group sync resolves member IDs)
+ *   Step 2 -- Group sync (only if CFG_SYNC_GROUPS = true)
+ *
+ * For each step, the provisioning mode (Delta or Full) is controlled by:
+ *   CFG_LDAP_USER_PROV_MODE  -- "Delta" (default) or "Full" for /Users
+ *   CFG_LDAP_GROUP_PROV_MODE -- "Delta" (default) or "Full" for /Groups
+ * sync() (Synchronize all) always runs full sync regardless of these settings.
+ * syncSince() (Synchronize changed users) uses the configured mode.
  */
 public class ScimTargetProviderFactory implements UserStorageProviderFactory<ScimTargetProvider>, ImportSynchronization {
 
@@ -51,10 +62,26 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
     public static final String CFG_SYNC_GROUPS        = "syncGroups";
 
     /**
-     * Optional comma-separated list of Keycloak group names to sync (e.g. "admins,developers").
-     * When blank, all groups are synced. Only meaningful when CFG_SYNC_GROUPS is true.
+     * Optional Java regex pattern for groups to sync via the LDAP sync path.
+     * When blank: only the group named by CFG_FILTER_GROUP is in scope.
+     * When set: any group whose name matches this regex is in scope.
+     * Only meaningful when CFG_SYNC_GROUPS is true.
      */
     public static final String CFG_SYNC_GROUPS_FILTER = "syncGroupsFilter";
+
+    /**
+     * LDAP Users Provisioning Mode for syncSince() (Synchronize changed users).
+     * "Delta" (default): flush only pending entries.
+     * "Full": re-provision all CFG_FILTER_GROUP members on every sync.
+     */
+    public static final String CFG_LDAP_USER_PROV_MODE = "ldapUserProvMode";
+
+    /**
+     * LDAP Groups Provisioning Mode for syncSince() (Synchronize changed users).
+     * "Delta" (default): flush only pending group entries.
+     * "Full": PATCH replace the full member list for all in-scope groups on every sync.
+     */
+    public static final String CFG_LDAP_GROUP_PROV_MODE = "ldapGroupProvMode";
 
     private static ProviderConfigProperty list(String help, String name, List<String> options, String def, boolean required) {
         ProviderConfigProperty p = new ProviderConfigProperty();
@@ -91,8 +118,18 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
             + "are pushed to SCIM /Groups. Disabled by default.", false, "Sync Groups"),
 
         prop(ProviderConfigProperty.STRING_TYPE, CFG_SYNC_GROUPS_FILTER,
-            "Group names to sync, separated by commas (e.g. admins,developers). Leave empty to sync all groups. Only used when Sync Groups is enabled.",
-            false, "Sync Groups Filter")
+            "Java regex pattern for group names to sync via the LDAP sync path "
+            + "(e.g. 'admins|developers|team-.*'). Leave empty to scope to Filter Group only. "
+            + "Only used when Sync Groups is enabled.",
+            false, "Sync Groups Filter (regex)"),
+
+        list("LDAP Users Provisioning Mode for 'Synchronize changed users': "
+            + "'Delta' flushes only pending changes (default); 'Full' re-provisions all filter-group members.",
+            CFG_LDAP_USER_PROV_MODE, List.of("Delta","Full"), "Delta", true),
+
+        list("LDAP Groups Provisioning Mode for 'Synchronize changed users': "
+            + "'Delta' flushes only pending group changes (default); 'Full' sends a complete member-list replace for all in-scope groups.",
+            CFG_LDAP_GROUP_PROV_MODE, List.of("Delta","Full"), "Delta", true)
     );
 
     @Override
@@ -146,20 +183,16 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
             throw new ComponentValidationException("Invalid deprovisionAction. Use 'deactivate' or 'delete'.");
         }
 
-        // Validate that every group name in syncGroupsFilter exists in the realm
+        // CFG_SYNC_GROUPS_FILTER is now a Java regex -- no per-group name validation possible.
+        // Regex syntax errors will cause java.util.regex.PatternSyntaxException at runtime;
+        // we do a compile-check here to catch obvious mistakes early.
         String groupsFilter = get(model, CFG_SYNC_GROUPS_FILTER, null);
         if (groupsFilter != null && !groupsFilter.isBlank()) {
-            for (String raw : groupsFilter.split(",")) {
-                String name = raw.trim();
-                if (name.isEmpty()) continue;
-                final String n = name;
-                boolean found = session.groups()
-                        .searchForGroupByNameStream(realm, n, true, 0, 1)
-                        .anyMatch(g -> g.getName().equalsIgnoreCase(n));
-                if (!found) {
-                    throw new ComponentValidationException(
-                            "Sync Groups Filter: group '" + n + "' does not exist in realm '" + realm.getName() + "'.");
-                }
+            try {
+                java.util.regex.Pattern.compile(groupsFilter);
+            } catch (java.util.regex.PatternSyntaxException e) {
+                throw new ComponentValidationException(
+                        "Sync Groups Filter is not a valid Java regex: " + e.getMessage());
             }
         }
     }
@@ -173,19 +206,26 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
     public SynchronizationResult sync(KeycloakSessionFactory sessionFactory, String realmId, UserStorageProviderModel model) {
         info("Manual 'Synchronize all users' triggered for target=%s (componentId=%s) realm=%s",
                 model.getName(), model.getId(), realmId);
-        return runSweep(sessionFactory, realmId, model);
+        // Full sync regardless of configured mode
+        return runSweep(sessionFactory, realmId, model, true);
     }
 
     @Override
     public SynchronizationResult syncSince(Date lastSync, KeycloakSessionFactory sessionFactory, String realmId, UserStorageProviderModel model) {
         info("Manual 'Synchronize changed users' triggered for target=%s (componentId=%s) realm=%s lastSync=%s",
                 model.getName(), model.getId(), realmId, lastSync);
-        // We don't have an incremental changed-users query for our own attribute state,
-        // so we just run the same full pending-entries sweep, scoped to this component.
-        return runSweep(sessionFactory, realmId, model);
+        return runSweep(sessionFactory, realmId, model, false);
     }
 
-    private SynchronizationResult runSweep(KeycloakSessionFactory sessionFactory, String realmId, ComponentModel model) {
+    /**
+     * Runs the user sync sweep followed by (optionally) the group sync sweep.
+     *
+     * @param fullSync true when called from sync() (Synchronize all); false for syncSince()
+     *                 (Synchronize changed users). When true, always uses full-sync mode for
+     *                 both users and groups regardless of the configured provisioning mode keys.
+     */
+    private SynchronizationResult runSweep(KeycloakSessionFactory sessionFactory, String realmId,
+                                            ComponentModel model, boolean fullSync) {
         long start = System.currentTimeMillis();
         try {
             KeycloakModelUtils.runJobInTransaction(sessionFactory, session -> {
@@ -198,7 +238,22 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
                 // Downstream code (e.g. UserModel#setAttribute, group lookups) relies on
                 // session.getContext().getRealm() being set, so bind it explicitly before use.
                 session.getContext().setRealm(realm);
-                ScimMembershipSync.processPendingMembershipChanges(session, realm, model.getId());
+
+                // ---- Step 1: User sync (always before group sync) ----
+                if (fullSync || "Full".equals(get(model, CFG_LDAP_USER_PROV_MODE, "Delta"))) {
+                    ScimMembershipSync.processFullUserSync(session, realm, model.getId());
+                } else {
+                    ScimMembershipSync.processPendingMembershipChanges(session, realm, model.getId());
+                }
+
+                // ---- Step 2: Group sync (only if CFG_SYNC_GROUPS = true) ----
+                if ("true".equalsIgnoreCase(get(model, CFG_SYNC_GROUPS, "false"))) {
+                    if (fullSync || "Full".equals(get(model, CFG_LDAP_GROUP_PROV_MODE, "Delta"))) {
+                        ScimGroupSync.processFullGroupSync(session, realm, model.getId());
+                    } else {
+                        ScimGroupSync.processPendingGroupMembershipChanges(session, realm, model.getId());
+                    }
+                }
             });
             info("Manual sync for target=%s completed in %dms", model.getName(), System.currentTimeMillis() - start);
         } catch (Exception e) {
@@ -207,8 +262,7 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
             failed.setFailed(1);
             return failed;
         }
-        SynchronizationResult result = new SynchronizationResult();
-        return result;
+        return new SynchronizationResult();
     }
 
     /* ===== Helpers ===== */
