@@ -15,8 +15,8 @@ A lightweight **Keycloak extension** that provisions users and groups to externa
   - `attribute` → use a custom Keycloak user attribute
 - 🧱 **SCIM v2 compatible** — Works with `/Users`, optional `/Groups` sync, and `/ServiceProviderConfig` endpoints.
 - 🔒 **Token-based authentication (Bearer)** — no password sync required.
-- 📂 **LDAP/AD support** - Optional [LDAP/AD support](#-optional-ldap--active-directory-integration) via a built-in `LdapSyncNotifierMapper`
-- 🗂️ **Optional SCIM Group sync** — Push Keycloak group create/rename/delete and membership changes to SCIM `/Groups`. Opt-in, disabled by default; this feature does not yet support LDAP.
+- 📂 **LDAP/AD support** — Optional [LDAP/AD support](#-optional-ldap--active-directory-integration) via a built-in `LdapSyncNotifierMapper`.
+- 🗂️ **Optional SCIM Group sync** — Push Keycloak group create/rename/delete and membership changes to SCIM `/Groups`. Opt-in, disabled by default. Supports both event-driven (admin console) and **LDAP-driven** membership changes.
 
 ---
 
@@ -65,15 +65,17 @@ Once deployed:
 3. Fill in the following fields:
 
 | Field | Description | Required |
-| --------------------------- | --------------------------------------------------------------------- | -------- |
-| **SCIM Base URL**           | Base endpoint of your SCIM API, e.g. `https://app.example.com/scim/v2` | ✅        |
-| **SCIM Token**              | Bearer token for authenticating with the SCIM target                  | ✅        |
-| **Filter Group (optional)** | Only users in this group will be provisioned                          | ❌        |
-| **userName Strategy**       | How to build SCIM `userName` (`username`, `email`, or `attribute`)    | ✅        |
-| **userName Attribute**      | Custom user attribute name (only if strategy = `attribute`)           | ❌        |
-| **Deprovision Action**      | What to do on delete / group removal: `deactivate` (PATCH `active=false`, default) or `delete` (`DELETE /Users/{id}`) | ✅        |
-| **Sync Groups**             | Enable SCIM `/Groups` sync. When `true`, group create/rename/delete and membership changes are pushed to the SCIM target. **Disabled by default.** | ❌        |
-| **Sync Groups Filter**      | Comma-separated list of group names to sync (e.g. `admins,developers`). Leave blank to sync **all** groups. Names are validated against the realm on save. Only used when *Sync Groups* is enabled. | ❌        |
+| ----------------------------------- | ----------------------------------------------------------------------------- | -------- |
+| **SCIM Base URL** | Base endpoint of your SCIM API, e.g. `https://app.example.com/scim/v2` | ✅ |
+| **SCIM Token** | Bearer token for authenticating with the SCIM target | ✅ |
+| **Filter Group (optional)** | Only users in this group will be provisioned | ❌ |
+| **userName Strategy** | How to build SCIM `userName` (`username`, `email`, or `attribute`) | ✅ |
+| **userName Attribute** | Custom user attribute name (only if strategy = `attribute`) | ❌ |
+| **Deprovision Action** | What to do on delete / group removal: `deactivate` (PATCH `active=false`, default) or `delete` (`DELETE /Users/{id}`) | ✅ |
+| **Sync Groups** | Enable SCIM `/Groups` sync. When `true`, group create/rename/delete and membership changes are pushed to the SCIM target. **Disabled by default.** | ❌ |
+| **Sync Groups Filter (regex)** | Java regex pattern for the group names to include in LDAP-driven group sync (e.g. `admins\|developers\|team-.*`). Leave blank to scope to *Filter Group* only. Only used when *Sync Groups* is enabled. | ❌ |
+| **LDAP Users Provisioning Mode** | How LDAP-driven user sync runs on *Synchronize changed users*: `Delta` (default, flush pending changes only) or `Full` (re-provision all *Filter Group* members). | ✅ |
+| **LDAP Groups Provisioning Mode** | How LDAP-driven group sync runs on *Synchronize changed users*: `Delta` (default, flush pending member changes only) or `Full` (send a complete member-list replace for all in-scope groups). | ✅ |
 
 ---
 
@@ -81,13 +83,13 @@ Once deployed:
 
 | Event | Action |
 | --------------------------------- | ------------------------------------------------------------------------------- |
-| **REGISTER**                      | Create new SCIM user                                                            |
-| **UPDATE_PROFILE / UPDATE_EMAIL** | Update SCIM user fields                                                         |
-| **UPDATE_CREDENTIAL (password)**  | Patch password if supported                                                     |
-| **DELETE_ACCOUNT**                | Deprovision SCIM user (deactivate or delete, per *Deprovision Action*)          |
-| **Admin CREATE/UPDATE/DELETE**    | Sync CRUD operations                                                            |
-| **Group membership add/remove**   | Provision/deprovision users based on group membership (if `filterGroup` is set); also updates SCIM group member list (if `Sync Groups` is enabled) |
-| **Group CREATE/UPDATE/DELETE**    | Create, rename, or delete the corresponding SCIM group (only if `Sync Groups` is enabled) |
+| **REGISTER** | Create new SCIM user |
+| **UPDATE_PROFILE / UPDATE_EMAIL** | Update SCIM user fields |
+| **UPDATE_CREDENTIAL (password)** | Patch password if supported |
+| **DELETE_ACCOUNT** | Deprovision SCIM user (deactivate or delete, per *Deprovision Action*) |
+| **Admin CREATE/UPDATE/DELETE** | Sync CRUD operations |
+| **Group membership add/remove** | Provision/deprovision users based on group membership (if `filterGroup` is set); also updates SCIM group member list (if `Sync Groups` is enabled) |
+| **Group CREATE/UPDATE/DELETE** | Create, rename, or delete the corresponding SCIM group (only if `Sync Groups` is enabled) |
 
 > ℹ️ **Lifecycle lookup & deprovisioning:** users are matched by SCIM `externalId` (the Keycloak user id) first, falling back to `userName` for users provisioned before `externalId` existed. The `externalId` is also backfilled on update for legacy users. Deprovisioning defaults to **deactivate** (`PATCH active=false`); set *Deprovision Action* to `delete` for providers that require a hard delete (e.g. VMware vCenter).
 
@@ -102,28 +104,37 @@ Group sync is **opt-in** and disabled by default to avoid affecting existing dep
 In the provider configuration (*User Federation → keycloak-scim-outbound*):
 
 1. Toggle **Sync Groups** to `true`.
-2. Optionally, fill **Sync Groups Filter** with the group names you want to sync, separated by commas (e.g. `admins,developers`). Leave it blank to sync all groups. Keycloak will reject names that do not exist in the realm when you save.
+2. Optionally fill **Sync Groups Filter (regex)** with a Java regex pattern for the group names you want to sync via the LDAP path (e.g. `admins|developers|team-.*`). Leave blank to scope LDAP-driven group sync to *Filter Group* only.
 3. Save.
 
 ### What gets synced
 
-| Keycloak event | SCIM operation |
-|---|---|
-| Group created | `POST /Groups` — creates an empty group with `externalId` = Keycloak group UUID and `displayName` = group name |
-| Group renamed | `PATCH /Groups/{id}` — updates `displayName` |
-| Group deleted | `DELETE /Groups/{id}` — found by `externalId` (stable, even after deletion) |
-| User added to group | `PATCH /Groups/{id}` — adds the user as a member (`op: add`) |
-| User removed from group | `PATCH /Groups/{id}` — removes the member using the SCIM path-filter form: `members[value eq "<userId>"]` (RFC 7644 §3.5.2) |
+| Source | Keycloak event / trigger | SCIM operation |
+|---|---|---|
+| Admin / event-driven | Group created | `POST /Groups` — creates an empty group with `externalId` = Keycloak group UUID and `displayName` = group name |
+| Admin / event-driven | Group renamed | `PATCH /Groups/{id}` — updates `displayName` |
+| Admin / event-driven | Group deleted | `DELETE /Groups/{id}` — found by `externalId` |
+| Admin / event-driven | User added to group | `PATCH /Groups/{id}` — adds the user as a member (`op: add`) |
+| Admin / event-driven | User removed from group | `PATCH /Groups/{id}` — removes the member using the SCIM path-filter form: `members[value eq "<userId>"]` (RFC 7644 §3.5.2) |
+| LDAP sync (delta) | User's group membership changed in LDAP | `PATCH /Groups/{id}` — individual `add` or `remove` per changed member |
+| LDAP sync (full) | *Synchronize all users* or Full mode | `PATCH /Groups/{id}` — complete `replace` of the entire member list |
 
 Groups are matched in SCIM by `externalId` (Keycloak UUID) first, falling back to `displayName`. The `externalId` is set at creation time, so renames do not break the link.
 
+### Sync execution order
+
+When a sync sweep runs, **user sync always executes before group sync**. This guarantees that every in-scope user already has a SCIM ID by the time group sync resolves member IDs.
+
 ### Provisioning scope
 
-Membership updates in SCIM only apply to **users that are already provisioned**. If a user was never pushed to the SCIM target (e.g. because they are outside the configured `Filter Group`), they will not have a SCIM id and will be silently skipped when updating group membership. No unintended users are created.
+- **User provisioning** is scoped to members of *Filter Group*.
+- **Group sync (event-driven)** applies to any group matching the *Sync Groups Filter* regex, or *Filter Group* only when the filter is blank.
+- **Group sync (LDAP-driven)** applies the same regex/blank-filter rule. Only users within the *Filter Group* provisioning scope are included when building the member list.
 
 ### Limitations
 
-- **No initial full-sync**: enabling *Sync Groups* does not retroactively push existing groups or their current members. Only events that happen *after* enabling will be processed. To seed existing groups, trigger a group update or re-create them.
+- **No retroactive full-sync on first enable**: enabling *Sync Groups* does not automatically push existing groups or their current members. Click **Synchronize all users** on the SCIM outbound provider after enabling to trigger an initial full sync.
+- **SCIM group must exist before LDAP sync can update its members**: the LDAP sync path logs a warning and skips any group not found in the SCIM target. Create the group first (via an admin event or manually in the target) before relying on LDAP-driven member updates for it.
 - **Permissions are not assigned**: creating a group via SCIM does not automatically grant it any permissions in the target system. Permission assignment must be done manually in the target after the group is created.
 - **Top-level groups only**: nested Keycloak sub-groups fire the same `GROUP` events and are synced as flat groups in SCIM (SCIM v2 Groups do not have a native hierarchy).
 - **Target must support `/Groups`**: not all SCIM implementations expose the Groups resource. Check your target's documentation or `ServiceProviderConfig` before enabling.
@@ -156,9 +167,9 @@ kc.sh start --log-level=org.keycloak.events=DEBUG,es.diegosr.keycloak_scim_outbo
 
 | Target | Base URL | Notes |
 | -------------- | -------------------------------------------------- | -------------------------- |
-| **Passbolt**   | `https://your-passbolt-domain/scim/v2`             | Works out of the box       |
-| **Nextcloud**  | `https://cloud.example.com/apps/user_saml/scim/v2` | Requires SCIM app enabled  |
-| **Custom app** | Any compliant SCIM v2 endpoint                     | Supports `/Users` and `/Groups` resources |
+| **Passbolt** | `https://your-passbolt-domain/scim/v2` | Works out of the box |
+| **Nextcloud** | `https://cloud.example.com/apps/user_saml/scim/v2` | Requires SCIM app enabled |
+| **Custom app** | Any compliant SCIM v2 endpoint | Supports `/Users` and `/Groups` resources |
 
 ---
 
@@ -187,9 +198,11 @@ keycloak-scim-outbound/
     ├── ScimEventListenerProvider.java
     ├── ScimEventListenerProviderFactory.java
     ├── http/ScimClient.java
+    ├── ldapsync/GroupMembershipState.java
     ├── ldapsync/LdapSyncNotifierMapper.java
     ├── ldapsync/LdapSyncNotifierMapperFactory.java
     ├── ldapsync/MembershipState.java
+    ├── ldapsync/ScimGroupSync.java
     ├── ldapsync/ScimMembershipSync.java
     ├── ui/ScimTargetProviderFactory.java
     ├── ui/ScimTargetProvider.java
@@ -216,9 +229,32 @@ If group membership is managed directly in Keycloak (e.g. via the Admin Console 
 
 ### What does it do?
 
-During every LDAP sync run, `LdapSyncNotifierMapper` compares each user's current group membership (as resolved from LDAP) against the last recorded state. When it detects a change it writes a small pending marker to a local Keycloak user attribute. A background sweep — running every **5 minutes** via Keycloak's built-in timer, or immediately when you click **Synchronize** on the SCIM outbound provider — reads those markers and pushes the corresponding SCIM provisioning or deprovisioning calls.
+During every LDAP sync run, `LdapSyncNotifierMapper` compares each user's current group membership (as resolved from LDAP) against the last recorded state. When it detects a change it writes a small pending marker:
 
-> ℹ️ This mapper handles **LDAP-driven membership changes for user provisioning** (`/Users`). It does not manage SCIM `/Groups` resources; group objects in the SCIM target are not created or modified.
+- **For `/Users`** — a marker on the user's local Keycloak attributes (`MembershipState`), picked up by `ScimMembershipSync`.
+- **For `/Groups`** — a marker on the relevant group's local Keycloak attributes (`GroupMembershipState`), picked up by `ScimGroupSync` (only when *Sync Groups* is enabled).
+
+Both sets of markers are flushed the next time a sync sweep runs.
+
+### Sync trigger
+
+Pending membership changes are flushed in two ways:
+
+- **On demand** — clicking **Synchronize all users** or **Synchronize changed users** on the SCIM outbound provider in User Federation triggers an immediate flush for that specific target.
+- **Automatically** — configure a **Sync Interval** directly in the admin console under *User Federation → your SCIM provider → Sync Settings*. Keycloak's native sync scheduler will call the sweep at that interval. No separate background timer is needed.
+
+If a SCIM push fails (e.g. the target is temporarily unreachable), the pending marker is left in place and the push is retried on the next sweep.
+
+### Provisioning modes (Delta vs. Full)
+
+Both user sync and group sync support two modes, configurable per target under the *LDAP Users Provisioning Mode* and *LDAP Groups Provisioning Mode* settings:
+
+| Mode | `/Users` behavior | `/Groups` behavior |
+|---|---|---|
+| **Delta** (default) | Flush only users with pending `NEW_ADDED` / `NEW_DELETED` entries | Flush only groups with pending member add/remove entries |
+| **Full** | Re-provision every current member of *Filter Group*; deprovision any previously-sent users who left | Send a complete `PATCH replace` of the full member list for every in-scope group |
+
+*Synchronize all users* always runs full mode regardless of this setting. *Synchronize changed users* uses the configured mode.
 
 ### How to add LdapSyncNotifierMapper
 
@@ -233,15 +269,6 @@ During every LDAP sync run, `LdapSyncNotifierMapper` compares each user's curren
 `LdapSyncNotifierMapper` **must be placed after the built-in `group-ldap-mapper`** in the mapper list. Keycloak runs mappers in order during a sync; the group mapper must have already resolved the user's group membership from LDAP before the notifier mapper inspects it.
 
 To check or adjust the order, go to **User Federation → your LDAP provider → Mappers** and verify that `group-ldap-mapper` appears above `LdapSyncNotifierMapper` in the list.
-
-### The 5-minute sweep and manual sync
-
-Pending membership changes are flushed in two ways:
-
-- **Automatically** — a background task runs every 5 minutes and processes all pending entries across all realms and SCIM targets. No action is required.
-- **On demand** — clicking **Synchronize all users** or **Synchronize changed users** on the SCIM outbound provider in User Federation triggers an immediate flush for that specific target.
-
-If a SCIM push fails (e.g. the target is temporarily unreachable), the pending marker is left in place and the push is retried on the next sweep.
 
 ---
 
