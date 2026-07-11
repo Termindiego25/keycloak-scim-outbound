@@ -429,6 +429,128 @@ public final class ScimGroupSync {
     }
 
     // =========================================================================
+    // Deprovision sweep
+    // =========================================================================
+
+    /**
+     * Deprovisions (deletes) SCIM groups that were previously provisioned by this target
+     * but are no longer in scope (their KC group name no longer matches isGroupInScope).
+     *
+     * A group is considered "previously provisioned" when it still carries at least one
+     * GroupMembershipState attribute entry for this target's componentId. Groups that were
+     * created in SCIM by other means (no KC state attributes) are never touched.
+     *
+     * Logic per target:
+     *   1. Full-scan all KC realm groups and collect those that have a GroupMembershipState
+     *      entry for this target (= were provisioned at some point). This scan is acceptable
+     *      because group counts are small (tens to low hundreds).
+     *   2. Filter to those where isGroupInScope(target, group.getName()) returns false.
+     *   3. For each out-of-scope group:
+     *      a. Resolve its SCIM group id via resolveScimGroupId (no upsert).
+     *      b. If found remotely: send DELETE /Groups/{scimGroupId}.
+     *         On success: call clearGroupState to remove KC attributes.
+     *         On failure: log ERROR; leave KC attributes intact (will retry next cycle).
+     *      c. If not found remotely: the remote group is already gone. Call
+     *         clearGroupState for housekeeping and log INFO.
+     *
+     * This method must NOT be called from crossCheckGroupMembers or upsertScimGroup.
+     * It is a top-level sweep, invoked from runSweep as Step 3.
+     *
+     * @param componentIdFilter scoped to this target only; always non-null in practice
+     *                          (runSweep passes model.getId()).
+     */
+    public static void deprovisionOutOfScopeGroups(KeycloakSession session, RealmModel realm,
+                                                    String componentIdFilter) {
+        long start = System.currentTimeMillis();
+        debug("=== deprovisionOutOfScopeGroups START realm=%s componentIdFilter=%s ===",
+                realm.getName(), componentIdFilter);
+
+        List<ComponentModel> targets = scimTargets(realm, componentIdFilter);
+        if (targets.isEmpty()) {
+            debug("No matching SCIM targets in realm=%s. Nothing to deprovision.", realm.getName());
+            return;
+        }
+
+        for (ComponentModel target : targets) {
+            if (!"true".equalsIgnoreCase(ScimTargetProviderFactory.get(
+                    target, ScimTargetProviderFactory.CFG_SYNC_GROUPS, "false"))) {
+                continue;
+            }
+
+            String base  = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_BASE_URL, null);
+            String token = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_TOKEN, null);
+            if (base == null || token == null) {
+                err("Target=%s: incomplete config. Skipping deprovision sweep.", target.getName());
+                continue;
+            }
+            ScimClient client = new ScimClient(base, token);
+
+            // Step 1: find all KC groups that carry a GroupMembershipState entry for this target.
+            // Full group-stream scan is acceptable: groups are few (tens to low hundreds).
+            // Keycloak has no indexed group-attribute search API.
+            List<GroupModel> previouslyProvisioned = session.groups()
+                    .getGroupsStream(realm)
+                    .filter(g -> {
+                        List<String> vals = g.getAttributeStream(
+                                GroupMembershipState.ATTRIBUTE_NAME).toList();
+                        return vals.stream()
+                                .map(GroupMembershipState::parse)
+                                .filter(Optional::isPresent)
+                                .map(Optional::get)
+                                .anyMatch(e -> e.componentId().equals(target.getId()));
+                    })
+                    .collect(Collectors.toList());
+
+            // Step 2: keep only those no longer in scope.
+            List<GroupModel> outOfScope = previouslyProvisioned.stream()
+                    .filter(g -> !isGroupInScope(target, g.getName()))
+                    .collect(Collectors.toList());
+
+            if (outOfScope.isEmpty()) {
+                debug("Target=%s: no out-of-scope provisioned group(s) found.", target.getName());
+                continue;
+            }
+            debug("Target=%s: %d out-of-scope group(s) to deprovision.", target.getName(), outOfScope.size());
+
+            // Step 3: delete each out-of-scope group from SCIM.
+            for (GroupModel group : outOfScope) {
+                Optional<String> scimGroupId = resolveScimGroupId(
+                        client, target, group.getId(), group.getName());
+
+                if (scimGroupId.isEmpty()) {
+                    // Group already gone remotely; clean up KC state only.
+                    info("Target=%s: SCIM group for KC group '%s' (id=%s) not found remotely. "
+                            + "Cleaning up KC attributes only.",
+                            target.getName(), group.getName(), group.getId());
+                    clearGroupState(group, target.getId());
+                    continue;
+                }
+
+                debug("Calling client.deleteGroup scimGroupId=%s group='%s' target=%s",
+                        scimGroupId.get(), group.getName(), target.getName());
+                try {
+                    boolean ok = client.deleteGroup(scimGroupId.get());
+                    if (ok) {
+                        info("DEPROVISIONED group='%s' scimGroupId=%s target=%s -> DELETE OK",
+                                group.getName(), scimGroupId.get(), target.getName());
+                        clearGroupState(group, target.getId());
+                    } else {
+                        err("DEPROVISION FAILED group='%s' scimGroupId=%s target=%s. Will retry next cycle.",
+                                group.getName(), scimGroupId.get(), target.getName());
+                        // KC attributes left intact so the group is retried on the next cycle.
+                    }
+                } catch (Exception e) {
+                    err("DEPROVISION EXCEPTION group='%s' scimGroupId=%s target=%s: %s",
+                            group.getName(), scimGroupId.get(), target.getName(), e.getMessage());
+                }
+            }
+        }
+
+        debug("=== deprovisionOutOfScopeGroups DONE realm=%s durationMs=%d ===",
+                realm.getName(), System.currentTimeMillis() - start);
+    }
+
+    // =========================================================================
     // Helpers
     // =========================================================================
 
