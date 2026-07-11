@@ -97,6 +97,9 @@ public final class ScimGroupSync {
                 continue;
             }
             ScimClient client = new ScimClient(base, token);
+            String removeForm = ScimTargetProviderFactory.get(target,
+                    ScimTargetProviderFactory.CFG_GROUP_MEMBER_REMOVE_FORM,
+                    ScimMapper.REMOVE_FORM_RFC_PATH_FILTER);
 
             // Determine all in-scope groups for this target. Used both for the pending flush and
             // (when mode is "Delta provision and deprovision") for the cross-check.
@@ -181,7 +184,7 @@ public final class ScimGroupSync {
                             debug("Calling client.patchGroup(remove) group=%s scimGroupId=%s userId=%s scimUserId=%s target=%s",
                                     group.getName(), scimGroupId.get(), entry.userId(), scimUserId.get(), target.getName());
                             boolean ok = client.patchGroup(scimGroupId.get(),
-                                    ScimMapper.buildGroupMemberPatch("remove", scimUserId.get()));
+                                    ScimMapper.buildGroupMemberPatch("remove", scimUserId.get(), removeForm));
                             if (ok) {
                                 updatedValues.remove(raw);
                                 groupChanged = true;
@@ -360,6 +363,11 @@ public final class ScimGroupSync {
                                                List<GroupModel> inScopeGroups) {
         debug("crossCheckGroupMembers START target=%s groups=%d", target.getName(), inScopeGroups.size());
 
+        // Read remove form from config; target is already a parameter so no signature change needed.
+        String removeForm = ScimTargetProviderFactory.get(target,
+                ScimTargetProviderFactory.CFG_GROUP_MEMBER_REMOVE_FORM,
+                ScimMapper.REMOVE_FORM_RFC_PATH_FILTER);
+
         // Determine user provisioning scope boundary: members of CFG_FILTER_GROUP
         String filterGroupName = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
         Set<String> scopedUserIds = new HashSet<>();
@@ -416,7 +424,7 @@ public final class ScimGroupSync {
                         remoteId, group.getName(), target.getName());
                 try {
                     boolean ok = client.patchGroup(scimGroupId,
-                            ScimMapper.buildGroupMemberPatch("remove", remoteId));
+                            ScimMapper.buildGroupMemberPatch("remove", remoteId, removeForm));
                     if (ok) {
                         removedTotal++;
                         info("CROSS-CHECK REMOVE group=%s scimUserId=%s target=%s -> OK",
