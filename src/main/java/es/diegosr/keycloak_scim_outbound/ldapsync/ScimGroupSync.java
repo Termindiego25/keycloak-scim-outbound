@@ -126,6 +126,8 @@ public final class ScimGroupSync {
 
                     try {
                         if (entry.state() == GroupMembershipState.State.NEW_ADDED) {
+                            debug("Calling client.patchGroup(add) group=%s scimGroupId=%s userId=%s scimUserId=%s target=%s",
+                                    group.getName(), scimGroupId.get(), entry.userId(), scimUserId.get(), target.getName());
                             boolean ok = client.patchGroup(scimGroupId.get(),
                                     ScimMapper.buildGroupMemberPatch("add", scimUserId.get()));
                             if (ok) {
@@ -143,6 +145,8 @@ public final class ScimGroupSync {
                                         group.getName(), entry.userId(), target.getName());
                             }
                         } else if (entry.state() == GroupMembershipState.State.NEW_DELETED) {
+                            debug("Calling client.patchGroup(remove) group=%s scimGroupId=%s userId=%s scimUserId=%s target=%s",
+                                    group.getName(), scimGroupId.get(), entry.userId(), scimUserId.get(), target.getName());
                             boolean ok = client.patchGroup(scimGroupId.get(),
                                     ScimMapper.buildGroupMemberPatch("remove", scimUserId.get()));
                             if (ok) {
@@ -261,6 +265,8 @@ public final class ScimGroupSync {
                 }
 
                 try {
+                    debug("Calling client.patchGroup(replace) group=%s scimGroupId=%s target=%s members=%d",
+                            group.getName(), scimGroupId.get(), target.getName(), scimMemberIds.size());
                     boolean ok = client.patchGroup(scimGroupId.get(),
                             ScimMapper.buildGroupMemberReplace(scimMemberIds));
                     if (ok) {
@@ -331,22 +337,28 @@ public final class ScimGroupSync {
     }
 
     private static Optional<String> resolveScimGroupId(ScimClient client, String externalId, String displayName) {
+        debug("resolveScimGroupId CALL externalId=%s displayName=%s", externalId, displayName);
         Optional<String> id = (externalId != null && !externalId.isBlank())
                 ? client.findGroupIdByExternalId(externalId)
                 : Optional.empty();
         if (id.isEmpty() && displayName != null && !displayName.isBlank()) {
+            debug("resolveScimGroupId: externalId lookup empty, falling back to displayName=%s", displayName);
             id = client.findGroupIdByDisplayName(displayName);
         }
+        debug("resolveScimGroupId RESULT externalId=%s displayName=%s -> %s", externalId, displayName, id.orElse("<none>"));
         return id;
     }
 
     private static Optional<String> resolveScimUserId(ScimClient client, String externalId, String scimUserName) {
+        debug("resolveScimUserId CALL externalId=%s scimUserName=%s", externalId, scimUserName);
         Optional<String> id = (externalId != null && !externalId.isBlank())
                 ? client.findUserIdByExternalId(externalId)
                 : Optional.empty();
         if (id.isEmpty() && scimUserName != null && !scimUserName.isBlank()) {
+            debug("resolveScimUserId: externalId lookup empty, falling back to userName=%s", scimUserName);
             id = client.findUserIdByUserName(scimUserName);
         }
+        debug("resolveScimUserId RESULT externalId=%s scimUserName=%s -> %s", externalId, scimUserName, id.orElse("<none>"));
         return id;
     }
 
