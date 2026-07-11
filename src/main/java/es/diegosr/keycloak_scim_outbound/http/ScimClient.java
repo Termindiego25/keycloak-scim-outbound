@@ -8,6 +8,8 @@ import java.net.URLEncoder;
 import java.net.http.*;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -243,6 +245,61 @@ public class ScimClient {
             httpErr("%s failed: %s", operation, e.getMessage());
         }
         return Optional.empty();
+    }
+
+    /**
+     * Returns the list of SCIM user IDs that are members of the given SCIM group.
+     * Fetches the group directly by SCIM id (GET /Groups/{id}) and extracts the
+     * "members" array. A missing or empty members array is treated as an empty list
+     * and is never an error. Used by the cross-check in ScimGroupSync.
+     *
+     * This is the flat-API equivalent of the future ScimClient.Groups.getMembers()
+     * (section 5.4 of the coding guidelines). It will be replaced when the inner-class
+     * refactor is done.
+     *
+     * @param scimGroupId the SCIM id of the group (not the KC externalId)
+     * @return list of SCIM user id strings; empty if the group has no members or is not found
+     */
+    public List<String> getGroupMembers(String scimGroupId) {
+        if (scimGroupId == null || scimGroupId.isBlank()) return List.of();
+        String path = groupPath(scimGroupId);
+        try {
+            HttpRequest req = baseRequestBuilder(path).GET().build();
+            httpDebug("getGroupMembers request: GET %s", path);
+            HttpResponse<String> res = sendWithRetries(req);
+            httpDebug("getGroupMembers response: status=%d", res.statusCode());
+
+            if (!is2xx(res.statusCode())) {
+                httpErr("GET %s -> %d %s", path, res.statusCode(), safeBody(res));
+                return List.of();
+            }
+            String body = res.body();
+            if (body == null || body.isBlank()) return List.of();
+
+            JsonNode root = JSON.readTree(body);
+            // RFC 7643 s4.2 specifies "members" (lowercase). Some servers capitalise.
+            JsonNode members = root.path("members");
+            if (!members.isArray() || members.isEmpty()) {
+                members = root.path("Members");
+            }
+            if (!members.isArray() || members.isEmpty()) {
+                httpDebug("getGroupMembers: no members array in response for scimGroupId=%s", scimGroupId);
+                return List.of();
+            }
+
+            List<String> ids = new ArrayList<>();
+            for (JsonNode member : members) {
+                JsonNode val = member.path("value");
+                if (val.isTextual() && !val.asText().isBlank()) {
+                    ids.add(val.asText());
+                }
+            }
+            httpDebug("getGroupMembers: scimGroupId=%s -> %d member(s)", scimGroupId, ids.size());
+            return ids;
+        } catch (Exception e) {
+            httpErr("getGroupMembers failed for scimGroupId=%s: %s", scimGroupId, e.getMessage());
+            return List.of();
+        }
     }
 
     /** Create SCIM group; returns true on 201/200. */
