@@ -40,7 +40,9 @@ public class ScimClient {
     public boolean smokeTest() {
         try {
             HttpRequest req = baseRequestBuilder("/ServiceProviderConfig").GET().build();
+            httpDebug("GET /ServiceProviderConfig (smokeTest) request: bearerPresent=%s", bearer != null && !bearer.isBlank());
             HttpResponse<String> res = sendWithRetries(req);
+            httpDebug("GET /ServiceProviderConfig (smokeTest) response: status=%d body=%s", res.statusCode(), res.body());
             return is2xx(res.statusCode());
         } catch (Exception e) {
             httpErr("smokeTest failed: %s", e.getMessage());
@@ -66,7 +68,10 @@ public class ScimClient {
             String query = "filter=" + urlEncode(filter);
             HttpRequest req = baseRequestBuilder("/Users?" + query).GET().build();
 
+            httpDebug("%s request: GET /Users?%s", operation, query);
             HttpResponse<String> res = sendWithRetries(req);
+            httpDebug("%s response: status=%d body=%s", operation, res.statusCode(), res.body());
+
             if (is2xx(res.statusCode())) {
                 String body = res.body();
                 ScimListResponse users = parseListResponse(body);
@@ -115,7 +120,10 @@ public class ScimClient {
                     .POST(HttpRequest.BodyPublishers.ofString(jsonPayload))
                     .build();
 
+            httpDebug("POST /Users request body: %s", jsonPayload);
             HttpResponse<String> res = sendWithRetries(req);
+            httpDebug("POST /Users response: status=%d body=%s", res.statusCode(), res.body());
+
             if (res.statusCode() == 201 || res.statusCode() == 200) return true;
 
             if (res.statusCode() == 409) {
@@ -139,7 +147,9 @@ public class ScimClient {
         String path = userPath(id);
         try {
             HttpRequest req = baseRequestBuilder(path).DELETE().build();
+            httpDebug("DELETE %s request", path);
             HttpResponse<String> res = sendWithRetries(req);
+            httpDebug("DELETE %s response: status=%d body=%s", path, res.statusCode(), res.body());
             boolean ok = res.statusCode() == 204 || res.statusCode() == 200 || res.statusCode() == 404;
             if (!ok) httpErr("DELETE %s -> %d %s", path, res.statusCode(), safeBody(res));
             return ok;
@@ -167,7 +177,11 @@ public class ScimClient {
             String filter = attribute + " eq " + scimFilterString(value);
             String query = "filter=" + urlEncode(filter);
             HttpRequest req = baseRequestBuilder("/Groups?" + query).GET().build();
+
+            httpDebug("%s request: GET /Groups?%s", operation, query);
             HttpResponse<String> res = sendWithRetries(req);
+            httpDebug("%s response: status=%d body=%s", operation, res.statusCode(), res.body());
+
             if (is2xx(res.statusCode())) {
                 ScimListResponse groups = parseListResponse(res.body());
                 httpInfo("GET /Groups?%s -> %d totalResults=%d", query, res.statusCode(), groups.totalResults());
@@ -188,7 +202,9 @@ public class ScimClient {
                     .header("Content-Type", "application/scim+json")
                     .POST(HttpRequest.BodyPublishers.ofString(jsonPayload))
                     .build();
+            httpDebug("POST /Groups request body: %s", jsonPayload);
             HttpResponse<String> res = sendWithRetries(req);
+            httpDebug("POST /Groups response: status=%d body=%s", res.statusCode(), res.body());
             if (res.statusCode() == 201 || res.statusCode() == 200) return true;
             if (res.statusCode() == 409) {
                 httpInfo("POST /Groups got 409 conflict: %s", safeBody(res));
@@ -212,7 +228,9 @@ public class ScimClient {
         String path = groupPath(id);
         try {
             HttpRequest req = baseRequestBuilder(path).DELETE().build();
+            httpDebug("DELETE %s request", path);
             HttpResponse<String> res = sendWithRetries(req);
+            httpDebug("DELETE %s response: status=%d body=%s", path, res.statusCode(), res.body());
             boolean ok = res.statusCode() == 204 || res.statusCode() == 200 || res.statusCode() == 404;
             if (!ok) httpErr("DELETE %s -> %d %s", path, res.statusCode(), safeBody(res));
             return ok;
@@ -231,7 +249,10 @@ public class ScimClient {
                     .header("Content-Type", "application/scim+json")
                     .method(method, body);
 
+            httpDebug("%s %s request body: %s", method, path, json);
             HttpResponse<String> res = sendWithRetries(b.build());
+            httpDebug("%s %s response: status=%d body=%s", method, path, res.statusCode(), res.body());
+
             if (matches(res.statusCode(), okCodes)) return true;
 
             httpErr("%s %s -> %d %s", method, path, res.statusCode(), safeBody(res));
@@ -261,6 +282,7 @@ public class ScimClient {
             try {
                 res = http.send(req, HttpResponse.BodyHandlers.ofString());
             } catch (Exception e) {
+                httpDebug("Attempt %d for %s %s threw %s", attempt, req.method(), req.uri(), e.getMessage());
                 if (attempt > this.maxRetries) throw e;
                 sleep(backoff);
                 backoff = Math.min(backoff * 2, 2000L);
@@ -271,6 +293,8 @@ public class ScimClient {
             if (is2xx(sc)) return res;
 
             if ((sc == 429 || (sc >= 500 && sc <= 599)) && attempt <= this.maxRetries) {
+                httpDebug("Attempt %d for %s %s got retryable status=%d, backing off %dms",
+                        attempt, req.method(), req.uri(), sc, backoff);
                 sleep(backoff);
                 backoff = Math.min(backoff * 2, 2000L);
                 continue;
@@ -286,7 +310,7 @@ public class ScimClient {
     private static String groupPath(String id) { return "/Groups/" + urlEncode(id); }
     private static String urlEncode(String s) { return URLEncoder.encode(s, StandardCharsets.UTF_8).replace("+", "%20"); }
     private static void sleep(long ms) { try { Thread.sleep(ms); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); } }
-    private static String safeBody(HttpResponse<String> res) { String b = res.body(); return b == null ? "" : (b.length() > 400 ? b.substring(0, 400) + " …" : b); }
+    private static String safeBody(HttpResponse<String> res) { String b = res.body(); return b == null ? "" : (b.length() > 400 ? b.substring(0, 400) + " ..." : b); }
 
     private static String scimFilterString(String value) { return "\"" + jsonEscape(value) + "\""; }
     private static String jsonEscape(String s) {
@@ -294,7 +318,7 @@ public class ScimClient {
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);
             switch (c) {
-                case '"' -> out.append("\\\"");
+                case '"'  -> out.append("\\\"");
                 case '\\' -> out.append("\\\\");
                 case '\b' -> out.append("\\b");
                 case '\f' -> out.append("\\f");
@@ -315,8 +339,9 @@ public class ScimClient {
 
     /* ===== timestamped logging (stdout/stderr) ===== */
     private static String now() { return java.time.OffsetDateTime.now().toString(); }
-    private static void httpInfo(String fmt, Object... args) { System.out.printf("%s [keycloak-scim-outbound/HTTP] %s%n", now(), String.format(fmt, args)); }
-    private static void httpErr(String fmt, Object... args)  { System.err.printf("%s [keycloak-scim-outbound/HTTP] %s%n", now(), String.format(fmt, args)); }
+    private static void httpInfo(String fmt, Object... args)  { System.out.printf("%s [keycloak-scim-outbound/HTTP] %s%n", now(), String.format(fmt, args)); }
+    private static void httpErr(String fmt, Object... args)   { System.err.printf("%s [keycloak-scim-outbound/HTTP] %s%n", now(), String.format(fmt, args)); }
+    private static void httpDebug(String fmt, Object... args) { System.out.printf("%s [keycloak-scim-outbound/HTTP] DEBUG %s%n", now(), String.format(fmt, args)); }
 
     private record ScimListResponse(int totalResults, Optional<String> firstId, boolean resourcesPresent) {}
 }
