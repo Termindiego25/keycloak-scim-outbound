@@ -39,8 +39,8 @@ public final class ScimGroupSync {
      * Mode values for CFG_LDAP_GROUP_PROV_MODE.
      * Must stay in sync with the list options in ScimTargetProviderFactory.PROPS.
      */
-    public static final String MODE_DELTA_ONLY        = "Delta provision only";
-    public static final String MODE_DELTA_DEPROVISION = "Delta provision and deprovision";
+    public static final String MODE_DELTA_ONLY        = "Delta (add members)";
+    public static final String MODE_DELTA_DEPROVISION = "Delta (add and remove members)";
     public static final String MODE_FULL              = "Full";
 
     private ScimGroupSync() {}
@@ -54,9 +54,9 @@ public final class ScimGroupSync {
      * The provisioning mode governs which pending states are flushed and whether the
      * cross-check runs afterward:
      *
-     *   "Delta provision only"            -- flush NEW_ADDED only; no cross-check
-     *   "Delta provision and deprovision" -- flush NEW_ADDED + NEW_DELETED; then run
-     *                                        crossCheckGroupMembers over all in-scope groups
+     *   "Delta (add members)"            -- flush NEW_ADDED only; no cross-check
+     *   "Delta (add and remove members)" -- flush NEW_ADDED + NEW_DELETED; then run
+     *                                       crossCheckGroupMembers over all in-scope groups
      *
      * "Full" mode is never routed here; callers must use processFullGroupSync instead.
      *
@@ -102,7 +102,7 @@ public final class ScimGroupSync {
                     ScimMapper.REMOVE_FORM_RFC_PATH_FILTER);
 
             // Determine all in-scope groups for this target. Used both for the pending flush and
-            // (when mode is "Delta provision and deprovision") for the cross-check.
+            // (when mode is "Delta (add and remove members)") for the cross-check.
             List<GroupModel> inScopeGroups = resolveInScopeGroups(session, realm, target);
             debug("Target=%s: %d in-scope group(s) total.", target.getName(), inScopeGroups.size());
 
@@ -121,7 +121,6 @@ public final class ScimGroupSync {
                 List<String> stateValues = new ArrayList<>(
                         group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME).toList());
 
-                // resolveScimGroupId reads CFG_LOOKUP_STRATEGY from target
                 Optional<String> scimGroupId = resolveScimGroupId(client, target, group.getId(), group.getName());
                 if (scimGroupId.isEmpty()) {
                     err("Target=%s: SCIM group not found for KC group '%s' (id=%s). Skipping.",
@@ -139,18 +138,16 @@ public final class ScimGroupSync {
                     if (!entry.componentId().equals(target.getId())) continue;
                     if (entry.state() == GroupMembershipState.State.SENT) continue;
 
-                    // Skip NEW_DELETED entries when mode is "Delta provision only"
+                    // Skip NEW_DELETED entries when mode is "Delta (add members)"
                     if (entry.state() == GroupMembershipState.State.NEW_DELETED && !flushDeletes) {
                         debug("Mode=%s: skipping NEW_DELETED for group=%s userId=%s target=%s",
                                 mode, group.getName(), entry.userId(), target.getName());
                         continue;
                     }
 
-                    // Resolve KC user to get their SCIM userName for fallback lookup
                     UserModel kcUser = session.users().getUserById(realm, entry.userId());
                     String scimUserName = kcUser != null ? computeScimUserName(target, kcUser) : null;
 
-                    // resolveScimUserId reads CFG_LOOKUP_STRATEGY from target
                     Optional<String> scimUserId = resolveScimUserId(client, target, entry.userId(), scimUserName);
                     if (scimUserId.isEmpty()) {
                         err("Target=%s: SCIM user not found for userId=%s (group=%s). Skipping this member entry.",
@@ -262,11 +259,9 @@ public final class ScimGroupSync {
             }
             ScimClient client = new ScimClient(base, token);
 
-            // Determine in-scope groups for this target
             List<GroupModel> inScopeGroups = resolveInScopeGroups(session, realm, target);
             debug("Target=%s: %d in-scope group(s) for full sync.", target.getName(), inScopeGroups.size());
 
-            // Determine user provisioning scope: members of CFG_FILTER_GROUP
             String filterGroupName = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
             List<String> scopedUserIds = new ArrayList<>();
             if (filterGroupName != null && !filterGroupName.isBlank()) {
@@ -279,7 +274,6 @@ public final class ScimGroupSync {
             for (GroupModel group : inScopeGroups) {
                 groupsProcessed++;
 
-                // resolveScimGroupId reads CFG_LOOKUP_STRATEGY from target
                 Optional<String> scimGroupId = resolveScimGroupId(client, target, group.getId(), group.getName());
                 if (scimGroupId.isEmpty()) {
                     err("Target=%s: SCIM group not found for KC group '%s' (id=%s). Skipping.",
@@ -288,17 +282,14 @@ public final class ScimGroupSync {
                     continue;
                 }
 
-                // Build the full member list: current KC members, intersected with scoped users
                 List<String> scimMemberIds = new ArrayList<>();
                 List<UserModel> groupMembers = session.users().getGroupMembersStream(realm, group).toList();
                 for (UserModel member : groupMembers) {
                     if (filterGroupName != null && !filterGroupName.isBlank()
                             && !scopedUserIds.contains(member.getId())) {
-                        // user is not in scope for user provisioning -- skip
                         continue;
                     }
                     String scimUserName = computeScimUserName(target, member);
-                    // resolveScimUserId reads CFG_LOOKUP_STRATEGY from target
                     Optional<String> scimUserId = resolveScimUserId(client, target, member.getId(), scimUserName);
                     if (scimUserId.isEmpty()) {
                         debug("Target=%s: SCIM user not found for userId=%s (group=%s). Skipping member.",
@@ -316,7 +307,6 @@ public final class ScimGroupSync {
                     if (ok) {
                         info("FULL SYNC group=%s target=%s members=%d -> OK",
                                 group.getName(), target.getName(), scimMemberIds.size());
-                        // Clear all state for this target on this group
                         clearGroupState(group, target.getId());
                     } else {
                         failures++;
@@ -346,7 +336,7 @@ public final class ScimGroupSync {
      * for each in-scope group. Removes any remote members absent from the local KC group
      * (intersected with the CFG_FILTER_GROUP scope boundary).
      *
-     * Only called in "Delta provision and deprovision" mode, after the pending-entry flush
+     * Only called in "Delta (add and remove members)" mode, after the pending-entry flush
      * has completed. No adds are performed here: Keycloak is the authority and missing
      * members are handled by the pending-entry flush or the next LDAP sync cycle.
      *
@@ -356,14 +346,12 @@ public final class ScimGroupSync {
     private static void crossCheckGroupMembers(KeycloakSession session, RealmModel realm,
                                                ComponentModel target, ScimClient client,
                                                List<GroupModel> inScopeGroups) {
-        debug("=== CROSS-CHECK: crossCheckGroupMembers START target=%s groups=%d", target.getName(), inScopeGroups.size());
+        debug("crossCheckGroupMembers START target=%s groups=%d", target.getName(), inScopeGroups.size());
 
-        // Read remove form from config; target is already a parameter so no signature change needed.
         String removeForm = ScimTargetProviderFactory.get(target,
                 ScimTargetProviderFactory.CFG_GROUP_MEMBER_REMOVE_FORM,
                 ScimMapper.REMOVE_FORM_RFC_PATH_FILTER);
 
-        // Determine user provisioning scope boundary: members of CFG_FILTER_GROUP
         String filterGroupName = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
         Set<String> scopedUserIds = new HashSet<>();
         if (filterGroupName != null && !filterGroupName.isBlank()) {
@@ -377,40 +365,33 @@ public final class ScimGroupSync {
         int failuresTotal = 0;
 
         for (GroupModel group : inScopeGroups) {
-            // Step 1: resolve the SCIM group; skip if not found (do not auto-create)
-            // resolveScimGroupId reads CFG_LOOKUP_STRATEGY from target
             Optional<String> scimGroupIdOpt = resolveScimGroupId(client, target, group.getId(), group.getName());
             if (scimGroupIdOpt.isEmpty()) {
-                debug("CROSS-CHECK PROCESS: SCIM group not found for KC group '%s' (id=%s). Skipping.",
+                debug("crossCheck: SCIM group not found for KC group '%s' (id=%s). Skipping.",
                         group.getName(), group.getId());
                 continue;
             }
             String scimGroupId = scimGroupIdOpt.get();
 
-            // Step 2: fetch the current remote member list via the flat API.
             List<String> remoteScimUserIds = client.getGroupMembers(scimGroupId);
-            debug("CROSS-CHECK PROCESS: group=%s scimGroupId=%s remote members=%d",
+            debug("crossCheck: group=%s scimGroupId=%s remote members=%d",
                     group.getName(), scimGroupId, remoteScimUserIds.size());
             if (remoteScimUserIds.isEmpty()) {
                 continue;
             }
 
-            // Step 3: build the local KC member set (scoped), resolved to SCIM user IDs
             Set<String> localScimUserIds = new HashSet<>();
             List<UserModel> groupMembers = session.users().getGroupMembersStream(realm, group).toList();
             for (UserModel member : groupMembers) {
-                // Apply scope boundary: only consider users in CFG_FILTER_GROUP
                 if (filterGroupName != null && !filterGroupName.isBlank()
                         && !scopedUserIds.contains(member.getId())) {
                     continue;
                 }
                 String scimUserName = computeScimUserName(target, member);
-                // resolveScimUserId reads CFG_LOOKUP_STRATEGY from target
                 Optional<String> scimUserId = resolveScimUserId(client, target, member.getId(), scimUserName);
                 scimUserId.ifPresent(localScimUserIds::add);
             }
 
-            // Step 4: remove remote members absent from the local set.
             for (String remoteId : remoteScimUserIds) {
                 if (localScimUserIds.contains(remoteId)) {
                     continue;
@@ -437,7 +418,7 @@ public final class ScimGroupSync {
             }
         }
 
-        debug("=== CROSS-CHECK: crossCheckGroupMembers DONE target=%s removedTotal=%d failuresTotal=%d",
+        debug("crossCheckGroupMembers DONE target=%s removedTotal=%d failuresTotal=%d",
                 target.getName(), removedTotal, failuresTotal);
     }
 
@@ -465,13 +446,11 @@ public final class ScimGroupSync {
                                                           ComponentModel target) {
         String filter = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_SYNC_GROUPS_FILTER, null);
         if (filter == null || filter.isBlank()) {
-            // No regex -- only the CFG_FILTER_GROUP itself is in scope
             String filterGroupName = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
             if (filterGroupName == null || filterGroupName.isBlank()) return List.of();
             return session.groups().searchForGroupByNameStream(realm, filterGroupName, true, null, null)
                     .collect(Collectors.toList());
         }
-        // Regex filter: iterate all groups and match
         return session.groups().getGroupsStream(realm)
                 .filter(g -> g.getName() != null && g.getName().matches(filter))
                 .collect(Collectors.toList());
@@ -515,9 +494,6 @@ public final class ScimGroupSync {
             if (r.totalResults() == 1) {
                 id = r.id();
             } else if (r.totalResults() > 1) {
-                // Ambiguous: the SCIM server returned multiple groups for a UUID-based
-                // externalId filter. This indicates a server-side data issue.
-                // Do not pick an arbitrary match -- fall back to displayName lookup.
                 debug("resolveScimGroupId: externalId=%s returned %d results (ambiguous), falling back to displayName",
                         externalId, r.totalResults());
             }
@@ -603,7 +579,6 @@ public final class ScimGroupSync {
      * on the given group, based on the updated state values list.
      */
     private static void writeGroupState(GroupModel group, String componentId, List<String> updatedValues) {
-        // Recompute pending flag: present if any entry for this target has state != SENT
         boolean hasPending = updatedValues.stream()
                 .map(GroupMembershipState::parse)
                 .filter(Optional::isPresent)
