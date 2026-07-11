@@ -98,7 +98,15 @@ public class ScimClient {
 
         JsonNode root = JSON.readTree(body);
         int totalResults = root.path("totalResults").asInt(0);
+
+        // RFC 7643 specifies "Resources" (capital R), but some SCIM server implementations
+        // return "resources" (lowercase). Jackson path() is case-sensitive, so we check
+        // both. The lowercase fallback was added after production logs showed the lookup
+        // always returning Optional.empty() despite a 200 response with results.
         JsonNode resources = root.path("Resources");
+        if (!resources.isArray() || resources.isEmpty()) {
+            resources = root.path("resources");
+        }
         boolean resourcesPresent = resources.isArray() && !resources.isEmpty();
 
         if (!resourcesPresent) {
@@ -171,6 +179,48 @@ public class ScimClient {
         return findGroupIdByFilter("externalId", externalId, "findGroupIdByExternalId");
     }
 
+    /**
+     * Find group by externalId and return both the id and the raw totalResults count.
+     * Callers that need to distinguish "not found" from "ambiguous hit" (totalResults > 1)
+     * should use this method instead of findGroupIdByExternalId.
+     * A UUID-based externalId should always yield exactly one result; more than one
+     * indicates a server-side data issue and the caller should fall back to a displayName
+     * lookup rather than picking an arbitrary match.
+     */
+    public ScimLookupResult findGroupByExternalId(String externalId) {
+        if (externalId == null || externalId.isBlank()) {
+            return new ScimLookupResult(Optional.empty(), 0);
+        }
+        try {
+            String filter = "externalId eq " + scimFilterString(externalId);
+            String query = "filter=" + urlEncode(filter);
+            HttpRequest req = baseRequestBuilder("/Groups?" + query).GET().build();
+
+            httpDebug("findGroupByExternalId request: GET /Groups?%s", query);
+            HttpResponse<String> res = sendWithRetries(req);
+            httpDebug("findGroupByExternalId response: status=%d body=%s", res.statusCode(), res.body());
+
+            if (is2xx(res.statusCode())) {
+                ScimListResponse groups = parseListResponse(res.body());
+                httpInfo("GET /Groups?%s -> %d totalResults=%d", query, res.statusCode(), groups.totalResults());
+                // Only return the id when exactly one result is returned; multiple results
+                // are ambiguous and the caller must fall back to a displayName lookup.
+                if (groups.totalResults() == 1 && groups.firstId().isPresent()) {
+                    return new ScimLookupResult(groups.firstId(), 1);
+                }
+                return new ScimLookupResult(Optional.empty(), groups.totalResults());
+            } else {
+                httpErr("GET /Groups?%s -> %d %s", query, res.statusCode(), safeBody(res));
+            }
+        } catch (Exception e) {
+            httpErr("findGroupByExternalId failed: %s", e.getMessage());
+        }
+        return new ScimLookupResult(Optional.empty(), 0);
+    }
+
+    /** Result type for group lookups that need to expose totalResults alongside the id. */
+    public record ScimLookupResult(Optional<String> id, int totalResults) {}
+
     private Optional<String> findGroupIdByFilter(String attribute, String value, String operation) {
         if (value == null || value.isBlank()) return Optional.empty();
         try {
@@ -202,9 +252,11 @@ public class ScimClient {
                     .header("Content-Type", "application/scim+json")
                     .POST(HttpRequest.BodyPublishers.ofString(jsonPayload))
                     .build();
+
             httpDebug("POST /Groups request body: %s", jsonPayload);
             HttpResponse<String> res = sendWithRetries(req);
             httpDebug("POST /Groups response: status=%d body=%s", res.statusCode(), res.body());
+
             if (res.statusCode() == 201 || res.statusCode() == 200) return true;
             if (res.statusCode() == 409) {
                 httpInfo("POST /Groups got 409 conflict: %s", safeBody(res));
@@ -318,7 +370,7 @@ public class ScimClient {
         for (int i = 0; i < s.length(); i++) {
             char c = s.charAt(i);
             switch (c) {
-                case '"'  -> out.append("\\\"");
+                case '"' -> out.append("\\\"");
                 case '\\' -> out.append("\\\\");
                 case '\b' -> out.append("\\b");
                 case '\f' -> out.append("\\f");
@@ -339,8 +391,8 @@ public class ScimClient {
 
     /* ===== timestamped logging (stdout/stderr) ===== */
     private static String now() { return java.time.OffsetDateTime.now().toString(); }
-    private static void httpInfo(String fmt, Object... args)  { System.out.printf("%s [keycloak-scim-outbound/HTTP] %s%n", now(), String.format(fmt, args)); }
-    private static void httpErr(String fmt, Object... args)   { System.err.printf("%s [keycloak-scim-outbound/HTTP] %s%n", now(), String.format(fmt, args)); }
+    private static void httpInfo(String fmt, Object... args) { System.out.printf("%s [keycloak-scim-outbound/HTTP] %s%n", now(), String.format(fmt, args)); }
+    private static void httpErr(String fmt, Object... args)  { System.err.printf("%s [keycloak-scim-outbound/HTTP] %s%n", now(), String.format(fmt, args)); }
     private static void httpDebug(String fmt, Object... args) { System.out.printf("%s [keycloak-scim-outbound/HTTP] DEBUG %s%n", now(), String.format(fmt, args)); }
 
     private record ScimListResponse(int totalResults, Optional<String> firstId, boolean resourcesPresent) {}
