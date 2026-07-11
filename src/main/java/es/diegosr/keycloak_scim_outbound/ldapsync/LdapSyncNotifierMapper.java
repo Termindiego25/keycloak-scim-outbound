@@ -114,11 +114,12 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
         // transitions on every sync. Remove this filter block once all realms have been
         // synced at least once with this build (revert: delete the two lines below and
         // restore the original one-liner).
+        List<String> allStoredValues = user.getAttributeStream(MembershipState.ATTRIBUTE_NAME).toList();
         List<String> currentValues = new ArrayList<>(
-                user.getAttributeStream(MembershipState.ATTRIBUTE_NAME)
+                allStoredValues.stream()
                         .filter(v -> MembershipState.parse(v).isPresent()) // drop v1 colon-delimited values
                         .toList());
-        boolean changed = false;
+        boolean changed = allStoredValues.size() != currentValues.size(); // force write if v1 values were dropped
 
         for (ComponentModel target : scimTargets) {
             String groupName = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
