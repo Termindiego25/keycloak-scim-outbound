@@ -57,9 +57,51 @@ public class ScimClient {
         return findUserIdByFilter("userName", userName, "findUserIdByUserName");
     }
 
-    /** Find user by externalId and return SCIM id if present. */
+    /**
+     * Find user by externalId and return SCIM id if present.
+     *
+     * Fix: some SCIM servers ignore the externalId filter and return all users
+     * (totalResults &gt; 1). In that case the response is ambiguous -- picking
+     * resources[0] would silently return the wrong user for every call. We now
+     * treat totalResults != 1 as a miss so the caller (resolveScimUserId in
+     * ScimGroupSync) falls through to the userName-based lookup. Servers that
+     * DO honour the filter still get a correct single-result fast path.
+     */
     public Optional<String> findUserIdByExternalId(String externalId) {
-        return findUserIdByFilter("externalId", externalId, "findUserIdByExternalId");
+        if (externalId == null || externalId.isBlank()) return Optional.empty();
+
+        try {
+            String filter = "externalId eq " + scimFilterString(externalId);
+            String query  = "filter=" + urlEncode(filter);
+            HttpRequest req = baseRequestBuilder("/Users?" + query).GET().build();
+
+            httpDebug("findUserIdByExternalId request: GET /Users?%s", query);
+            HttpResponse<String> res = sendWithRetries(req);
+            httpDebug("findUserIdByExternalId response: status=%d body=%s", res.statusCode(), res.body());
+
+            if (is2xx(res.statusCode())) {
+                ScimListResponse users = parseListResponse(res.body());
+                httpInfo("GET /Users?%s -> %d totalResults=%d", query, res.statusCode(), users.totalResults());
+
+                if (users.totalResults() == 1 && users.firstId().isPresent()) {
+                    return users.firstId();
+                }
+                if (users.totalResults() > 1) {
+                    // Server appears to ignore the externalId filter (returns all users).
+                    // Treat as a miss so the caller can fall back to a userName lookup.
+                    httpInfo("findUserIdByExternalId: totalResults=%d for externalId=%s -- "
+                           + "server likely ignores externalId filter; treating as miss, "
+                           + "caller should fall back to userName lookup.",
+                            users.totalResults(), externalId);
+                }
+                // totalResults == 0 or id not parseable: genuine miss, return empty
+            } else {
+                httpErr("GET /Users?%s -> %d %s", query, res.statusCode(), safeBody(res));
+            }
+        } catch (Exception e) {
+            httpErr("findUserIdByExternalId failed: %s", e.getMessage());
+        }
+        return Optional.empty();
     }
 
     private Optional<String> findUserIdByFilter(String attribute, String value, String operation) {
@@ -183,7 +225,7 @@ public class ScimClient {
 
     /**
      * Find group by externalId and return both the id and the raw totalResults count.
-     * Callers that need to distinguish "not found" from "ambiguous hit" (totalResults > 1)
+     * Callers that need to distinguish "not found" from "ambiguous hit" (totalResults &gt; 1)
      * should use this method instead of findGroupIdByExternalId.
      * A UUID-based externalId should always yield exactly one result; more than one
      * indicates a server-side data issue and the caller should fall back to a displayName
