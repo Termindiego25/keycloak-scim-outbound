@@ -170,7 +170,19 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
                 info("MARK NEW_DELETED user=%s target=%s group='%s' (id=%s) (was %s)",
                         user.getUsername(), target.getName(), groupName, groupId, old.state());
 
+            } else if (isMemberNow && existing.isPresent()
+                    && existing.get().state() == MembershipState.State.SENT) {
+                // No-op: user is in group and membership is already confirmed as SENT.
+                debug("No-op (already SENT) user=%s target=%s group='%s'",
+                        user.getUsername(), target.getName(), groupName);
+
+            } else if (!isMemberNow && existing.isEmpty()) {
+                // No-op: user is not in group and has never been tracked for this target.
+                debug("No-op (not member, no entry) user=%s target=%s group='%s'",
+                        user.getUsername(), target.getName(), groupName);
+
             } else {
+                // Catch-all: log whatever unexpected combination was encountered.
                 debug("No state transition needed for user=%s target=%s (isMemberNow=%s existing=%s)",
                         user.getUsername(), target.getName(), isMemberNow,
                         existing.map(MembershipState::state).orElse(null));
@@ -252,8 +264,26 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
                     info("GROUP MARK NEW_DELETED user=%s target=%s group='%s' (was %s)",
                             user.getUsername(), target.getName(), group.getName(), existing.get().state());
 
+                } else if (isInGroupNow && existing.isPresent()
+                        && existing.get().state() == GroupMembershipState.State.SENT) {
+                    // No-op: user is in group and membership is already confirmed as SENT.
+                    debug("GROUP no-op (already SENT) user=%s target=%s group='%s'",
+                            user.getUsername(), target.getName(), group.getName());
+
+                } else if (!isInGroupNow && existing.isPresent()
+                        && existing.get().state() == GroupMembershipState.State.NEW_DELETED) {
+                    // No-op: user is not in group and removal is already pending.
+                    debug("GROUP no-op (already NEW_DELETED) user=%s target=%s group='%s'",
+                            user.getUsername(), target.getName(), group.getName());
+
+                } else if (!isInGroupNow && existing.isEmpty()) {
+                    // No-op: user is not in group and was never tracked for this target.
+                    debug("GROUP no-op (not in group, no entry) user=%s target=%s group='%s'",
+                            user.getUsername(), target.getName(), group.getName());
+
                 } else {
-                    debug("GROUP no state transition for user=%s target=%s group='%s' (isInGroupNow=%s existing=%s)",
+                    // Catch-all: log whatever unexpected combination was encountered.
+                    debug("GROUP unexpected state combination for user=%s target=%s group='%s' (isInGroupNow=%s existing=%s)",
                             user.getUsername(), target.getName(), group.getName(), isInGroupNow,
                             existing.map(GroupMembershipState::state).orElse(null));
                 }
