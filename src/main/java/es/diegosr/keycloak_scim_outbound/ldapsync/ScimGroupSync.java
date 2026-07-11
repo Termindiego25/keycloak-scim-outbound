@@ -121,11 +121,12 @@ public final class ScimGroupSync {
                 List<String> stateValues = new ArrayList<>(
                         group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME).toList());
 
-                Optional<String> scimGroupId = resolveScimGroupId(client, target, group.getId(), group.getName());
+                // Upsert: resolve the SCIM group, creating it if it does not exist yet.
+                // Groups that originate purely from LDAP are never created by the event-driven
+                // path (Keycloak fires no GROUP_CREATE admin event during LDAP sync).
+                Optional<String> scimGroupId = upsertScimGroup(client, target, group);
                 if (scimGroupId.isEmpty()) {
-                    err("Target=%s: SCIM group not found for KC group '%s' (id=%s). Skipping.",
-                            target.getName(), group.getName(), group.getId());
-                    continue;
+                    continue; // upsertScimGroup already logged the error
                 }
 
                 boolean groupChanged = false;
@@ -274,12 +275,13 @@ public final class ScimGroupSync {
             for (GroupModel group : inScopeGroups) {
                 groupsProcessed++;
 
-                Optional<String> scimGroupId = resolveScimGroupId(client, target, group.getId(), group.getName());
+                // Upsert: resolve the SCIM group, creating it if it does not exist yet.
+                // Groups that originate purely from LDAP are never created by the event-driven
+                // path (Keycloak fires no GROUP_CREATE admin event during LDAP sync).
+                Optional<String> scimGroupId = upsertScimGroup(client, target, group);
                 if (scimGroupId.isEmpty()) {
-                    err("Target=%s: SCIM group not found for KC group '%s' (id=%s). Skipping.",
-                            target.getName(), group.getName(), group.getId());
                     failures++;
-                    continue;
+                    continue; // upsertScimGroup already logged the error
                 }
 
                 List<String> scimMemberIds = new ArrayList<>();
@@ -342,6 +344,10 @@ public final class ScimGroupSync {
      *
      * Cross-check removals are fire-and-forget: they do not write GroupMembershipState
      * attributes. Failed removals will be retried on the next sync cycle.
+     *
+     * This method must NOT auto-create missing SCIM groups. If a group is not found
+     * remotely during the cross-check, it is simply skipped. Group creation is handled
+     * by upsertScimGroup in the delta and full sync paths.
      */
     private static void crossCheckGroupMembers(KeycloakSession session, RealmModel realm,
                                                ComponentModel target, ScimClient client,
@@ -425,6 +431,52 @@ public final class ScimGroupSync {
     // =========================================================================
     // Helpers
     // =========================================================================
+
+    /**
+     * Resolves the SCIM id for the given KC group, creating the group in SCIM if it does
+     * not exist yet (upsert semantics). Returns empty only if creation fails or the id
+     * cannot be resolved after a successful create.
+     *
+     * The event-driven path (ScimEventListenerProvider) handles groups created via the KC
+     * admin console, but LDAP sync never fires those events. Groups that exist in LDAP but
+     * have not yet been provisioned to SCIM must therefore be auto-created here on first
+     * encounter.
+     *
+     * Callers: processPendingGroupMembershipChanges and processFullGroupSync.
+     * crossCheckGroupMembers must NOT call this method -- it only removes excess remote
+     * members and has no business creating new groups.
+     */
+    private static Optional<String> upsertScimGroup(ScimClient client, ComponentModel target,
+                                                     GroupModel group) {
+        Optional<String> scimGroupId = resolveScimGroupId(client, target, group.getId(), group.getName());
+        if (scimGroupId.isPresent()) {
+            return scimGroupId;
+        }
+
+        // Group not found in SCIM -- create it now.
+        info("Target=%s: SCIM group not found for KC group '%s' (id=%s). Auto-creating.",
+                target.getName(), group.getName(), group.getId());
+        String payload = ScimMapper.buildCreateGroup(group.getName(), group.getId());
+        debug("Calling client.createGroup group=%s target=%s payload=%s",
+                group.getName(), target.getName(), payload);
+        boolean created = client.createGroup(payload);
+        if (!created) {
+            err("Target=%s: Failed to auto-create SCIM group for KC group '%s' (id=%s). Skipping.",
+                    target.getName(), group.getName(), group.getId());
+            return Optional.empty();
+        }
+
+        // Re-resolve after creation to get the new SCIM id.
+        scimGroupId = resolveScimGroupId(client, target, group.getId(), group.getName());
+        if (scimGroupId.isEmpty()) {
+            err("Target=%s: Auto-created SCIM group for KC group '%s' (id=%s) but could not resolve id. Skipping.",
+                    target.getName(), group.getName(), group.getId());
+        } else {
+            info("Target=%s: Auto-created SCIM group '%s' -> scimGroupId=%s",
+                    target.getName(), group.getName(), scimGroupId.get());
+        }
+        return scimGroupId;
+    }
 
     /**
      * Returns true if the given group name is in scope for SCIM /Groups sync on this target.
