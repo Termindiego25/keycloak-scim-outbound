@@ -34,7 +34,8 @@ import java.util.List;
  *
  * For each step, the provisioning mode (Delta or Full) is controlled by:
  *   CFG_LDAP_USER_PROV_MODE  -- "Delta" (default) or "Full" for /Users
- *   CFG_LDAP_GROUP_PROV_MODE -- "Delta" (default) or "Full" for /Groups
+ *   CFG_LDAP_GROUP_PROV_MODE -- "Delta provision only" (default), "Delta provision and
+ *                                deprovision", or "Full" for /Groups
  * sync() (Synchronize all) always runs full sync regardless of these settings.
  * syncSince() (Synchronize changed users) uses the configured mode.
  */
@@ -78,7 +79,8 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
 
     /**
      * LDAP Groups Provisioning Mode for syncSince() (Synchronize changed users).
-     * "Delta" (default): flush only pending group entries.
+     * "Delta provision only" (default): flush NEW_ADDED entries only; no cross-check.
+     * "Delta provision and deprovision": flush NEW_ADDED + NEW_DELETED; run cross-check.
      * "Full": PATCH replace the full member list for all in-scope groups on every sync.
      */
     public static final String CFG_LDAP_GROUP_PROV_MODE = "ldapGroupProvMode";
@@ -128,8 +130,12 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
             CFG_LDAP_USER_PROV_MODE, List.of("Delta","Full"), "Delta", true),
 
         list("LDAP Groups Provisioning Mode for 'Synchronize changed users': "
-            + "'Delta' flushes only pending group changes (default); 'Full' sends a complete member-list replace for all in-scope groups.",
-            CFG_LDAP_GROUP_PROV_MODE, List.of("Delta","Full"), "Delta", true)
+            + "'Delta provision only' flushes pending adds only (default); "
+            + "'Delta provision and deprovision' flushes adds and removes then runs a cross-check; "
+            + "'Full' sends a complete member-list replace for all in-scope groups.",
+            CFG_LDAP_GROUP_PROV_MODE,
+            List.of(ScimGroupSync.MODE_DELTA_ONLY, ScimGroupSync.MODE_DELTA_DEPROVISION, ScimGroupSync.MODE_FULL),
+            ScimGroupSync.MODE_DELTA_ONLY, true)
     );
 
     @Override
@@ -248,10 +254,14 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
 
                 // ---- Step 2: Group sync (only if CFG_SYNC_GROUPS = true) ----
                 if ("true".equalsIgnoreCase(get(model, CFG_SYNC_GROUPS, "false"))) {
-                    if (fullSync || "Full".equals(get(model, CFG_LDAP_GROUP_PROV_MODE, "Delta"))) {
+                    String groupMode = get(model, CFG_LDAP_GROUP_PROV_MODE, ScimGroupSync.MODE_DELTA_ONLY);
+                    if (fullSync || ScimGroupSync.MODE_FULL.equals(groupMode)) {
                         ScimGroupSync.processFullGroupSync(session, realm, model.getId());
                     } else {
-                        ScimGroupSync.processPendingGroupMembershipChanges(session, realm, model.getId());
+                        // Delta provision only or Delta provision and deprovision:
+                        // processPendingGroupMembershipChanges reads the mode to decide
+                        // whether to flush removes and whether to run the cross-check.
+                        ScimGroupSync.processPendingGroupMembershipChanges(session, realm, model.getId(), groupMode);
                     }
                 }
             });
