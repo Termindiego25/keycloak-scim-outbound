@@ -10,8 +10,10 @@ import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
@@ -33,6 +35,14 @@ public final class ScimGroupSync {
 
     private static final String LOG_TAG = "[keycloak-scim-outbound/LDAP-GROUP-SYNC]";
 
+    /**
+     * Mode values for CFG_LDAP_GROUP_PROV_MODE.
+     * Must stay in sync with the list options in ScimTargetProviderFactory.PROPS.
+     */
+    static final String MODE_DELTA_ONLY        = "Delta provision only";
+    static final String MODE_DELTA_DEPROVISION = "Delta provision and deprovision";
+    static final String MODE_FULL              = "Full";
+
     private ScimGroupSync() {}
 
     // =========================================================================
@@ -41,15 +51,24 @@ public final class ScimGroupSync {
 
     /**
      * Process only groups that have a pending entry for the given target.
+     * The provisioning mode governs which pending states are flushed and whether the
+     * cross-check runs afterward:
+     *
+     *   "Delta provision only"            -- flush NEW_ADDED only; no cross-check
+     *   "Delta provision and deprovision" -- flush NEW_ADDED + NEW_DELETED; then run
+     *                                        crossCheckGroupMembers over all in-scope groups
+     *
+     * "Full" mode is never routed here; callers must use processFullGroupSync instead.
      *
      * @param componentIdFilter if non-null, scope to that target only (manual sync).
      *                          If null, process all targets (kept for symmetry, not used currently).
+     * @param mode              value of CFG_LDAP_GROUP_PROV_MODE as read by runSweep.
      */
     public static void processPendingGroupMembershipChanges(KeycloakSession session, RealmModel realm,
-                                                            String componentIdFilter) {
+                                                            String componentIdFilter, String mode) {
         long start = System.currentTimeMillis();
-        debug("=== processPendingGroupMembershipChanges START realm=%s componentIdFilter=%s ===",
-                realm.getName(), componentIdFilter == null ? "<all>" : componentIdFilter);
+        debug("=== processPendingGroupMembershipChanges START realm=%s componentIdFilter=%s mode=%s ===",
+                realm.getName(), componentIdFilter == null ? "<all>" : componentIdFilter, mode);
 
         List<ComponentModel> targets = scimTargets(realm, componentIdFilter);
         if (targets.isEmpty()) {
@@ -57,6 +76,9 @@ public final class ScimGroupSync {
                     realm.getName(), componentIdFilter);
             return;
         }
+
+        boolean flushDeletes = MODE_DELTA_DEPROVISION.equals(mode);
+        boolean runCrossCheck = MODE_DELTA_DEPROVISION.equals(mode);
 
         int groupsProcessed = 0;
         int pushedAdds = 0;
@@ -76,12 +98,16 @@ public final class ScimGroupSync {
             }
             ScimClient client = new ScimClient(base, token);
 
-            // Candidate groups: all realm groups that have a pending flag for this target.
-            // Keycloak does not expose a searchForGroupByAttributeStream in all versions,
-            // so we iterate the full group stream and filter by attribute. This is acceptable
-            // because the number of groups is typically small (tens to low hundreds), unlike
-            // users (potentially thousands).
-            List<GroupModel> candidates = session.groups().getGroupsStream(realm)
+            // Determine all in-scope groups for this target. Used both for the pending flush and
+            // (when mode is "Delta provision and deprovision") for the cross-check.
+            // Keycloak does not expose a searchForGroupByAttributeStream in all versions, so we
+            // iterate the full group stream and filter by attribute. This is acceptable because the
+            // number of groups is typically small (tens to low hundreds), unlike users (potentially thousands).
+            List<GroupModel> inScopeGroups = resolveInScopeGroups(session, realm, target);
+            debug("Target=%s: %d in-scope group(s) total.", target.getName(), inScopeGroups.size());
+
+            // Candidate groups: in-scope groups that have a pending flag for this target.
+            List<GroupModel> candidates = inScopeGroups.stream()
                     .filter(g -> {
                         List<String> pending = g.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME).toList();
                         return pending.contains(GroupMembershipState.pendingValue(target.getId()));
@@ -111,6 +137,13 @@ public final class ScimGroupSync {
                     GroupMembershipState entry = parsed.get();
                     if (!entry.componentId().equals(target.getId())) continue;
                     if (entry.state() == GroupMembershipState.State.SENT) continue;
+
+                    // Skip NEW_DELETED entries when mode is "Delta provision only"
+                    if (entry.state() == GroupMembershipState.State.NEW_DELETED && !flushDeletes) {
+                        debug("Mode=%s: skipping NEW_DELETED for group=%s userId=%s target=%s",
+                                mode, group.getName(), entry.userId(), target.getName());
+                        continue;
+                    }
 
                     // Resolve KC user to get their SCIM userName for fallback lookup
                     UserModel kcUser = session.users().getUserById(realm, entry.userId());
@@ -172,12 +205,20 @@ public final class ScimGroupSync {
                     writeGroupState(group, target.getId(), updatedValues);
                 }
             }
+
+            // Cross-check: runs once per target after all pending entries are flushed.
+            // Iterates ALL in-scope groups, not just those that had pending entries.
+            // Cost: one HTTP GET per in-scope group per delta sync cycle in this mode.
+            // Acceptable for deployments with tens of groups.
+            if (runCrossCheck) {
+                crossCheckGroupMembers(session, realm, target, client, inScopeGroups);
+            }
         }
 
         long durationMs = System.currentTimeMillis() - start;
-        info("=== processPendingGroupMembershipChanges DONE realm=%s componentIdFilter=%s: "
+        info("=== processPendingGroupMembershipChanges DONE realm=%s componentIdFilter=%s mode=%s: "
                         + "groupsProcessed=%d pushedAdds=%d pushedRemoves=%d failures=%d durationMs=%d ===",
-                realm.getName(), componentIdFilter == null ? "<all>" : componentIdFilter,
+                realm.getName(), componentIdFilter == null ? "<all>" : componentIdFilter, mode,
                 groupsProcessed, pushedAdds, pushedRemoves, failures, durationMs);
     }
 
@@ -250,7 +291,8 @@ public final class ScimGroupSync {
                 List<String> scimMemberIds = new ArrayList<>();
                 List<UserModel> groupMembers = session.users().getGroupMembersStream(realm, group).toList();
                 for (UserModel member : groupMembers) {
-                    if (!filterGroupName.isBlank() && !scopedUserIds.contains(member.getId())) {
+                    if (filterGroupName != null && !filterGroupName.isBlank()
+                            && !scopedUserIds.contains(member.getId())) {
                         // user is not in scope for user provisioning -- skip
                         continue;
                     }
@@ -291,6 +333,109 @@ public final class ScimGroupSync {
                         + "groupsProcessed=%d failures=%d durationMs=%d ===",
                 realm.getName(), componentIdFilter == null ? "<all>" : componentIdFilter,
                 groupsProcessed, failures, durationMs);
+    }
+
+    // =========================================================================
+    // Cross-check
+    // =========================================================================
+
+    /**
+     * Verifies that the remote SCIM group member list matches the local Keycloak state
+     * for each in-scope group. Removes any remote members absent from the local KC group
+     * (intersected with the CFG_FILTER_GROUP scope boundary).
+     *
+     * Only called in "Delta provision and deprovision" mode, after the pending-entry flush
+     * has completed. No adds are performed here: Keycloak is the authority and missing
+     * members are handled by the pending-entry flush or the next LDAP sync cycle.
+     *
+     * Cost: one HTTP GET per in-scope group per delta sync cycle. For deployments with
+     * tens of groups this is acceptable. If this becomes a concern, consider adding a
+     * configurable cross-check interval.
+     *
+     * Cross-check removals are fire-and-forget: they do not write GroupMembershipState
+     * attributes. Failed removals will be retried on the next sync cycle.
+     */
+    private static void crossCheckGroupMembers(KeycloakSession session, RealmModel realm,
+                                               ComponentModel target, ScimClient client,
+                                               List<GroupModel> inScopeGroups) {
+        debug("crossCheckGroupMembers START target=%s groups=%d", target.getName(), inScopeGroups.size());
+
+        // Determine user provisioning scope boundary: members of CFG_FILTER_GROUP
+        String filterGroupName = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
+        Set<String> scopedUserIds = new HashSet<>();
+        if (filterGroupName != null && !filterGroupName.isBlank()) {
+            session.groups().searchForGroupByNameStream(realm, filterGroupName, true, null, null)
+                    .findFirst()
+                    .ifPresent(fg -> session.users().getGroupMembersStream(realm, fg)
+                            .forEach(u -> scopedUserIds.add(u.getId())));
+        }
+
+        int removedTotal = 0;
+        int failuresTotal = 0;
+
+        for (GroupModel group : inScopeGroups) {
+            // Step 1: resolve the SCIM group; skip if not found (do not auto-create)
+            Optional<String> scimGroupIdOpt = resolveScimGroupId(client, group.getId(), group.getName());
+            if (scimGroupIdOpt.isEmpty()) {
+                debug("crossCheck: SCIM group not found for KC group '%s' (id=%s). Skipping.",
+                        group.getName(), group.getId());
+                continue;
+            }
+            String scimGroupId = scimGroupIdOpt.get();
+
+            // Step 2: fetch the current remote member list via the flat API.
+            // A missing or empty members array is treated as an empty list -- never an error.
+            List<String> remoteScimUserIds = client.getGroupMembers(scimGroupId);
+            debug("crossCheck: group=%s scimGroupId=%s remote members=%d",
+                    group.getName(), scimGroupId, remoteScimUserIds.size());
+            if (remoteScimUserIds.isEmpty()) {
+                continue;
+            }
+
+            // Step 3: build the local KC member set (scoped), resolved to SCIM user IDs
+            Set<String> localScimUserIds = new HashSet<>();
+            List<UserModel> groupMembers = session.users().getGroupMembersStream(realm, group).toList();
+            for (UserModel member : groupMembers) {
+                // Apply scope boundary: only consider users in CFG_FILTER_GROUP
+                if (filterGroupName != null && !filterGroupName.isBlank()
+                        && !scopedUserIds.contains(member.getId())) {
+                    continue;
+                }
+                String scimUserName = computeScimUserName(target, member);
+                Optional<String> scimUserId = resolveScimUserId(client, member.getId(), scimUserName);
+                scimUserId.ifPresent(localScimUserIds::add);
+            }
+
+            // Step 4: remove remote members absent from the local set.
+            // No adds are performed here -- only removals.
+            for (String remoteId : remoteScimUserIds) {
+                if (localScimUserIds.contains(remoteId)) {
+                    continue;
+                }
+                debug("crossCheck: removing excess remote member scimUserId=%s from group=%s target=%s",
+                        remoteId, group.getName(), target.getName());
+                try {
+                    boolean ok = client.patchGroup(scimGroupId,
+                            ScimMapper.buildGroupMemberPatch("remove", remoteId));
+                    if (ok) {
+                        removedTotal++;
+                        info("CROSS-CHECK REMOVE group=%s scimUserId=%s target=%s -> OK",
+                                group.getName(), remoteId, target.getName());
+                    } else {
+                        failuresTotal++;
+                        err("CROSS-CHECK REMOVE group=%s scimUserId=%s target=%s -> FAILED. Will retry next cycle.",
+                                group.getName(), remoteId, target.getName());
+                    }
+                } catch (Exception e) {
+                    failuresTotal++;
+                    err("CROSS-CHECK REMOVE EXCEPTION group=%s scimUserId=%s target=%s: %s",
+                            group.getName(), remoteId, target.getName(), e.getMessage());
+                }
+            }
+        }
+
+        debug("crossCheckGroupMembers DONE target=%s removedTotal=%d failuresTotal=%d",
+                target.getName(), removedTotal, failuresTotal);
     }
 
     // =========================================================================
