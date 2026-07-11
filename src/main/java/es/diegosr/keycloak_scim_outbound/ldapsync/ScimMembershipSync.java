@@ -157,7 +157,7 @@ public final class ScimMembershipSync {
                         if (entry.state() == MembershipState.State.NEW_ADDED) {
                             debug("Calling upsertUser: user=%s scimUserName=%s target=%s groupId=%s",
                                     user.getUsername(), scimUserName, target.getName(), entry.groupId());
-                            boolean ok = upsertUser(client, user, scimUserName);
+                            boolean ok = upsertUser(target, client, user, scimUserName);
                             if (ok) {
                                 updatedValues.remove(rawValue);
                                 MembershipState sent = new MembershipState(
@@ -313,7 +313,7 @@ public final class ScimMembershipSync {
                 try {
                     debug("Calling upsertUser (full): user=%s scimUserName=%s target=%s",
                             user.getUsername(), scimUserName, target.getName());
-                    boolean ok = upsertUser(client, user, scimUserName);
+                    boolean ok = upsertUser(target, client, user, scimUserName);
                     if (ok) {
                         usersUpserted++;
                         info("FULL UPSERT user=%s target=%s -> OK", user.getUsername(), target.getName());
@@ -453,41 +453,65 @@ public final class ScimMembershipSync {
         return (s == null || s.isBlank()) ? null : s;
     }
 
-    static boolean upsertUser(ScimClient scim, UserModel user, String scimUserName) {
+    /**
+     * Resolve or create the SCIM user, then patch it with the current KC state.
+     * Reads CFG_LOOKUP_STRATEGY from target to decide whether to attempt an
+     * externalId lookup before falling back to userName.
+     */
+    static boolean upsertUser(ComponentModel target, ScimClient scim, UserModel user, String scimUserName) {
         final String externalId = user.getId();
-        Optional<String> existingId = resolveScimId(scim, externalId, scimUserName);
+        Optional<String> existingId = resolveScimId(target, scim, externalId, scimUserName);
         if (existingId.isEmpty()) {
             boolean created = scim.createUser(ScimMapper.buildCreateUser(user, scimUserName));
             if (created) return true;
-            existingId = resolveScimId(scim, externalId, scimUserName);
+            existingId = resolveScimId(target, scim, externalId, scimUserName);
             return existingId.map(id -> scim.patchUser(id, ScimMapper.buildPatchUser(user, externalId))).orElse(false);
         } else {
             return scim.patchUser(existingId.get(), ScimMapper.buildPatchUser(user, externalId));
         }
     }
 
-    private static boolean deprovisionUser(ComponentModel t, ScimClient scim,
+    private static boolean deprovisionUser(ComponentModel target, ScimClient scim,
                                            String externalId, String scimUserName) {
-        Optional<String> id = resolveScimId(scim, externalId, scimUserName);
+        Optional<String> id = resolveScimId(target, scim, externalId, scimUserName);
         if (id.isEmpty()) {
-            debug("Deprovision NO-OP: user not found in SCIM target=%s (externalId=%s userName=%s)",
-                    t.getName(), externalId, scimUserName);
+            debug("Deprovision NO-OP: user not found in SCIM (externalId=%s userName=%s)",
+                    externalId, scimUserName);
             return true; // nothing to remove counts as a successful removal
         }
-        String mode = ScimTargetProviderFactory.get(t, ScimTargetProviderFactory.CFG_DEPROVISION, "deactivate");
+        String mode = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_DEPROVISION, "deactivate");
         if ("delete".equals(mode)) {
             return scim.deleteUser(id.get());
         }
         return scim.patchUser(id.get(), ScimMapper.buildDeactivatePatch());
     }
 
-    private static Optional<String> resolveScimId(ScimClient scim, String externalId, String scimUserName) {
-        Optional<String> id = (externalId != null && !externalId.isBlank())
-                ? scim.findUserIdByExternalId(externalId)
-                : Optional.empty();
+    /**
+     * Resolve the SCIM user id for a Keycloak user.
+     *
+     * Reads CFG_LOOKUP_STRATEGY from target:
+     *   "externalId first" (default): try findUserIdByExternalId first; fall back to
+     *     findUserIdByUserName if the result is empty.
+     *   "name only": skip the externalId HTTP call entirely; go straight to
+     *     findUserIdByUserName. Use when the SCIM server ignores the externalId filter.
+     */
+    private static Optional<String> resolveScimId(ComponentModel target, ScimClient scim,
+                                                   String externalId, String scimUserName) {
+        String strategy = ScimTargetProviderFactory.get(target,
+                ScimTargetProviderFactory.CFG_LOOKUP_STRATEGY,
+                ScimTargetProviderFactory.LOOKUP_STRATEGY_EXTERNAL_ID_FIRST);
+
+        Optional<String> id = Optional.empty();
+
+        if (!ScimTargetProviderFactory.LOOKUP_STRATEGY_NAME_ONLY.equals(strategy)
+                && externalId != null && !externalId.isBlank()) {
+            id = scim.findUserIdByExternalId(externalId);
+        }
+
         if (id.isEmpty() && scimUserName != null && !scimUserName.isBlank()) {
             id = scim.findUserIdByUserName(scimUserName);
         }
+
         return id;
     }
 
