@@ -356,7 +356,7 @@ public final class ScimGroupSync {
     private static void crossCheckGroupMembers(KeycloakSession session, RealmModel realm,
                                                ComponentModel target, ScimClient client,
                                                List<GroupModel> inScopeGroups) {
-        debug("crossCheckGroupMembers START target=%s groups=%d", target.getName(), inScopeGroups.size());
+        debug("=== CROSS-CHECK: crossCheckGroupMembers START target=%s groups=%d", target.getName(), inScopeGroups.size());
 
         // Read remove form from config; target is already a parameter so no signature change needed.
         String removeForm = ScimTargetProviderFactory.get(target,
@@ -381,7 +381,7 @@ public final class ScimGroupSync {
             // resolveScimGroupId reads CFG_LOOKUP_STRATEGY from target
             Optional<String> scimGroupIdOpt = resolveScimGroupId(client, target, group.getId(), group.getName());
             if (scimGroupIdOpt.isEmpty()) {
-                debug("crossCheck: SCIM group not found for KC group '%s' (id=%s). Skipping.",
+                debug("CROSS-CHECK PROCESS: SCIM group not found for KC group '%s' (id=%s). Skipping.",
                         group.getName(), group.getId());
                 continue;
             }
@@ -389,7 +389,7 @@ public final class ScimGroupSync {
 
             // Step 2: fetch the current remote member list via the flat API.
             List<String> remoteScimUserIds = client.getGroupMembers(scimGroupId);
-            debug("crossCheck: group=%s scimGroupId=%s remote members=%d",
+            debug("CROSS-CHECK PROCESS: group=%s scimGroupId=%s remote members=%d",
                     group.getName(), scimGroupId, remoteScimUserIds.size());
             if (remoteScimUserIds.isEmpty()) {
                 continue;
@@ -437,7 +437,7 @@ public final class ScimGroupSync {
             }
         }
 
-        debug("crossCheckGroupMembers DONE target=%s removedTotal=%d failuresTotal=%d",
+        debug("=== CROSS-CHECK: crossCheckGroupMembers DONE target=%s removedTotal=%d failuresTotal=%d",
                 target.getName(), removedTotal, failuresTotal);
     }
 
