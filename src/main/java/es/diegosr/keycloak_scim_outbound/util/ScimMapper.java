@@ -103,6 +103,10 @@ public final class ScimMapper {
      *   {"op":"add","path":"members","value":[{"value":"id"}]}
      * Uses the path-filter form for "remove" (better interoperability per RFC 7644 ss3.5.2):
      *   {"op":"remove","path":"members[value eq \"id\"]"}
+     *
+     * Fix: the remove branch previously emitted a stray literal \n sequence inside the
+     * JSON string (as the two characters backslash-n), corrupting the request body.
+     * The closing brace is now placed cleanly with the real newline before the next line.
      */
     public static String buildGroupMemberPatch(String op, String memberId) {
         final String escapedId = esc(nvl(memberId));
@@ -112,7 +116,7 @@ public final class ScimMapper {
                  + "  \"Operations\": [\n"
                  + "    {\"op\":\"remove\",\"path\":\"members[value eq \\\""
                  + escapedId
-                 + "\\\"]\"}\\n"
+                 + "\\\"]\"}\n"
                  + "  ]\n"
                  + "}\n";
         }
