@@ -108,18 +108,9 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
             return;
         }
 
-        // TEMP: filter out v1 colon-delimited values (e.g. "<componentId>:<groupName>:SENT")
-        // written by a previous version of this provider. MembershipState.parse() returns
-        // empty for those, so they would silently accumulate and cause spurious NEW_ADDED
-        // transitions on every sync. Remove this filter block once all realms have been
-        // synced at least once with this build (revert: delete the two lines below and
-        // restore the original one-liner).
-        List<String> allStoredValues = user.getAttributeStream(MembershipState.ATTRIBUTE_NAME).toList();
         List<String> currentValues = new ArrayList<>(
-                allStoredValues.stream()
-                        .filter(v -> MembershipState.parse(v).isPresent()) // drop v1 colon-delimited values
-                        .toList());
-        boolean changed = allStoredValues.size() != currentValues.size(); // force write if v1 values were dropped
+                user.getAttributeStream(MembershipState.ATTRIBUTE_NAME).toList());
+        boolean changed = false;
 
         for (ComponentModel target : scimTargets) {
             String groupName = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
