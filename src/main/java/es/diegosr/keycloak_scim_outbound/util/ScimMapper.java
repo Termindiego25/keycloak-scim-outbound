@@ -12,6 +12,21 @@ public final class ScimMapper {
 
     private ScimMapper() {}
 
+    /**
+     * Group member remove form options (CFG_GROUP_MEMBER_REMOVE_FORM).
+     *
+     * RFC_PATH_FILTER -- RFC 7644 path filter:
+     *   {"op":"remove","path":"members[value eq \"<id>\"]"}
+     *   Spec-compliant; some servers do not accept it without a value field.
+     *
+     * NON_RFC_VALUE_ARRAY -- Non-RFC value array:
+     *   {"op":"remove","path":"members","value":[{"value":"<id>"}]}
+     *   Not mandated by RFC 7644 for removes but accepted by servers that
+     *   require a value field on every operation (e.g. this deployment's target).
+     */
+    public static final String REMOVE_FORM_RFC_PATH_FILTER    = "RFC 7644 path filter";
+    public static final String REMOVE_FORM_NON_RFC_VALUE_ARRAY = "Non-RFC value array";
+
     /** Backward-compatible wrapper: uses Keycloak username if no explicit SCIM userName is provided. */
     public static String buildCreateUser(UserModel user) {
         String fallback = user != null ? user.getUsername() : "";
@@ -99,24 +114,48 @@ public final class ScimMapper {
 
     /**
      * Build PatchOp to add or remove a single member from a SCIM group.
-     * Uses the standard path+value form for "add":
-     *   {"op":"add","path":"members","value":[{"value":"id"}]}
-     * Uses the path-filter form for "remove" (better interoperability per RFC 7644 ss3.5.2):
-     *   {"op":"remove","path":"members[value eq \"id\"]"}
      *
-     * Fix: the remove branch previously emitted a stray literal \n sequence inside the
-     * JSON string (as the two characters backslash-n), corrupting the request body.
-     * The closing brace is now placed cleanly with the real newline before the next line.
+     * The "add" operation always uses the standard path+value form (RFC 7644 s3.5.2):
+     *   {"op":"add","path":"members","value":[{"value":"<id>"}]}
+     *
+     * The "remove" operation form is controlled by the removeForm parameter:
+     *
+     *   REMOVE_FORM_RFC_PATH_FILTER (default, spec-compliant):
+     *     {"op":"remove","path":"members[value eq \"<id>\"]"}
+     *
+     *   REMOVE_FORM_NON_RFC_VALUE_ARRAY (for servers that require a value field on removes):
+     *     {"op":"remove","path":"members","value":[{"value":"<id>"}]}
+     *
+     * Pass ScimTargetProviderFactory.get(target, CFG_GROUP_MEMBER_REMOVE_FORM,
+     * REMOVE_FORM_RFC_PATH_FILTER) as removeForm.
+     *
+     * @param op         "add" or "remove"
+     * @param memberId   SCIM user id of the member
+     * @param removeForm one of REMOVE_FORM_RFC_PATH_FILTER or REMOVE_FORM_NON_RFC_VALUE_ARRAY;
+     *                   ignored when op is "add"
      */
-    public static String buildGroupMemberPatch(String op, String memberId) {
+    public static String buildGroupMemberPatch(String op, String memberId, String removeForm) {
         final String escapedId = esc(nvl(memberId));
         if ("remove".equals(op)) {
+            if (REMOVE_FORM_NON_RFC_VALUE_ARRAY.equals(removeForm)) {
+                // Non-RFC value array form: servers that reject path-filter removes
+                // without a value field accept this form instead.
+                return "{\n"
+                     + "  \"schemas\": [\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\n"
+                     + "  \"Operations\": [\n"
+                     + "    {\"op\":\"remove\",\"path\":\"members\",\"value\":[{\"value\":\""
+                     + escapedId
+                     + "\"}]}\n"
+                     + "  ]\n"
+                     + "}\n";
+            }
+            // RFC 7644 path filter form (default)
             return "{\n"
                  + "  \"schemas\": [\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\n"
                  + "  \"Operations\": [\n"
                  + "    {\"op\":\"remove\",\"path\":\"members[value eq \\\""
                  + escapedId
-                 + "\\\"]\"}\n"
+                 + "\\\"]\"}\\n"
                  + "  ]\n"
                  + "}\n";
         }
@@ -128,6 +167,16 @@ public final class ScimMapper {
               ]
             }
             """.formatted(escapedId);
+    }
+
+    /**
+     * Backward-compatible overload: uses RFC 7644 path filter form for removes.
+     * Retained for call sites that do not have access to a ComponentModel
+     * (e.g. ScimEventListenerProvider). New call sites should use the three-argument
+     * overload and pass the configured removeForm.
+     */
+    public static String buildGroupMemberPatch(String op, String memberId) {
+        return buildGroupMemberPatch(op, memberId, REMOVE_FORM_RFC_PATH_FILTER);
     }
 
     /**
