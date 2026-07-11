@@ -103,9 +103,6 @@ public final class ScimGroupSync {
 
             // Determine all in-scope groups for this target. Used both for the pending flush and
             // (when mode is "Delta provision and deprovision") for the cross-check.
-            // Keycloak does not expose a searchForGroupByAttributeStream in all versions, so we
-            // iterate the full group stream and filter by attribute. This is acceptable because the
-            // number of groups is typically small (tens to low hundreds), unlike users (potentially thousands).
             List<GroupModel> inScopeGroups = resolveInScopeGroups(session, realm, target);
             debug("Target=%s: %d in-scope group(s) total.", target.getName(), inScopeGroups.size());
 
@@ -124,7 +121,8 @@ public final class ScimGroupSync {
                 List<String> stateValues = new ArrayList<>(
                         group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME).toList());
 
-                Optional<String> scimGroupId = resolveScimGroupId(client, group.getId(), group.getName());
+                // resolveScimGroupId reads CFG_LOOKUP_STRATEGY from target
+                Optional<String> scimGroupId = resolveScimGroupId(client, target, group.getId(), group.getName());
                 if (scimGroupId.isEmpty()) {
                     err("Target=%s: SCIM group not found for KC group '%s' (id=%s). Skipping.",
                             target.getName(), group.getName(), group.getId());
@@ -152,7 +150,8 @@ public final class ScimGroupSync {
                     UserModel kcUser = session.users().getUserById(realm, entry.userId());
                     String scimUserName = kcUser != null ? computeScimUserName(target, kcUser) : null;
 
-                    Optional<String> scimUserId = resolveScimUserId(client, entry.userId(), scimUserName);
+                    // resolveScimUserId reads CFG_LOOKUP_STRATEGY from target
+                    Optional<String> scimUserId = resolveScimUserId(client, target, entry.userId(), scimUserName);
                     if (scimUserId.isEmpty()) {
                         err("Target=%s: SCIM user not found for userId=%s (group=%s). Skipping this member entry.",
                                 target.getName(), entry.userId(), group.getName());
@@ -211,8 +210,6 @@ public final class ScimGroupSync {
 
             // Cross-check: runs once per target after all pending entries are flushed.
             // Iterates ALL in-scope groups, not just those that had pending entries.
-            // Cost: one HTTP GET per in-scope group per delta sync cycle in this mode.
-            // Acceptable for deployments with tens of groups.
             if (runCrossCheck) {
                 crossCheckGroupMembers(session, realm, target, client, inScopeGroups);
             }
@@ -282,7 +279,8 @@ public final class ScimGroupSync {
             for (GroupModel group : inScopeGroups) {
                 groupsProcessed++;
 
-                Optional<String> scimGroupId = resolveScimGroupId(client, group.getId(), group.getName());
+                // resolveScimGroupId reads CFG_LOOKUP_STRATEGY from target
+                Optional<String> scimGroupId = resolveScimGroupId(client, target, group.getId(), group.getName());
                 if (scimGroupId.isEmpty()) {
                     err("Target=%s: SCIM group not found for KC group '%s' (id=%s). Skipping.",
                             target.getName(), group.getName(), group.getId());
@@ -300,7 +298,8 @@ public final class ScimGroupSync {
                         continue;
                     }
                     String scimUserName = computeScimUserName(target, member);
-                    Optional<String> scimUserId = resolveScimUserId(client, member.getId(), scimUserName);
+                    // resolveScimUserId reads CFG_LOOKUP_STRATEGY from target
+                    Optional<String> scimUserId = resolveScimUserId(client, target, member.getId(), scimUserName);
                     if (scimUserId.isEmpty()) {
                         debug("Target=%s: SCIM user not found for userId=%s (group=%s). Skipping member.",
                                 target.getName(), member.getId(), group.getName());
@@ -351,10 +350,6 @@ public final class ScimGroupSync {
      * has completed. No adds are performed here: Keycloak is the authority and missing
      * members are handled by the pending-entry flush or the next LDAP sync cycle.
      *
-     * Cost: one HTTP GET per in-scope group per delta sync cycle. For deployments with
-     * tens of groups this is acceptable. If this becomes a concern, consider adding a
-     * configurable cross-check interval.
-     *
      * Cross-check removals are fire-and-forget: they do not write GroupMembershipState
      * attributes. Failed removals will be retried on the next sync cycle.
      */
@@ -383,7 +378,8 @@ public final class ScimGroupSync {
 
         for (GroupModel group : inScopeGroups) {
             // Step 1: resolve the SCIM group; skip if not found (do not auto-create)
-            Optional<String> scimGroupIdOpt = resolveScimGroupId(client, group.getId(), group.getName());
+            // resolveScimGroupId reads CFG_LOOKUP_STRATEGY from target
+            Optional<String> scimGroupIdOpt = resolveScimGroupId(client, target, group.getId(), group.getName());
             if (scimGroupIdOpt.isEmpty()) {
                 debug("crossCheck: SCIM group not found for KC group '%s' (id=%s). Skipping.",
                         group.getName(), group.getId());
@@ -392,7 +388,6 @@ public final class ScimGroupSync {
             String scimGroupId = scimGroupIdOpt.get();
 
             // Step 2: fetch the current remote member list via the flat API.
-            // A missing or empty members array is treated as an empty list -- never an error.
             List<String> remoteScimUserIds = client.getGroupMembers(scimGroupId);
             debug("crossCheck: group=%s scimGroupId=%s remote members=%d",
                     group.getName(), scimGroupId, remoteScimUserIds.size());
@@ -410,12 +405,12 @@ public final class ScimGroupSync {
                     continue;
                 }
                 String scimUserName = computeScimUserName(target, member);
-                Optional<String> scimUserId = resolveScimUserId(client, member.getId(), scimUserName);
+                // resolveScimUserId reads CFG_LOOKUP_STRATEGY from target
+                Optional<String> scimUserId = resolveScimUserId(client, target, member.getId(), scimUserName);
                 scimUserId.ifPresent(localScimUserIds::add);
             }
 
             // Step 4: remove remote members absent from the local set.
-            // No adds are performed here -- only removals.
             for (String remoteId : remoteScimUserIds) {
                 if (localScimUserIds.contains(remoteId)) {
                     continue;
@@ -492,18 +487,30 @@ public final class ScimGroupSync {
     /**
      * Resolve the SCIM group id for a Keycloak group.
      *
-     * Strategy:
-     * 1. Query by externalId. If exactly one result is returned, use it.
-     * 2. If zero results: group not found by externalId, fall through to displayName.
-     * 3. If more than one result: the SCIM server returned an ambiguous match for a
-     *    UUID-based filter (server-side data issue). Do not pick an arbitrary match --
-     *    fall back to displayName lookup and log a warning.
+     * Behaviour is governed by CFG_LOOKUP_STRATEGY on the given target:
+     *
+     *   "externalId first" (default):
+     *     1. Query by externalId. If exactly one result is returned, use it.
+     *     2. If zero results: not found by externalId, fall through to displayName.
+     *     3. If more than one result: ambiguous (server-side data issue). Do not pick an
+     *        arbitrary match -- fall back to displayName and log a warning.
+     *
+     *   "name only":
+     *     Skip the externalId HTTP call entirely. Go straight to displayName lookup.
+     *     Use this when the SCIM server ignores the externalId filter.
      */
-    private static Optional<String> resolveScimGroupId(ScimClient client, String externalId, String displayName) {
+    private static Optional<String> resolveScimGroupId(ScimClient client, ComponentModel target,
+                                                        String externalId, String displayName) {
         debug("resolveScimGroupId CALL externalId=%s displayName=%s", externalId, displayName);
 
+        String strategy = ScimTargetProviderFactory.get(target,
+                ScimTargetProviderFactory.CFG_LOOKUP_STRATEGY,
+                ScimTargetProviderFactory.LOOKUP_STRATEGY_EXTERNAL_ID_FIRST);
+
         Optional<String> id = Optional.empty();
-        if (externalId != null && !externalId.isBlank()) {
+
+        if (!ScimTargetProviderFactory.LOOKUP_STRATEGY_NAME_ONLY.equals(strategy)
+                && externalId != null && !externalId.isBlank()) {
             ScimClient.ScimLookupResult r = client.findGroupByExternalId(externalId);
             if (r.totalResults() == 1) {
                 id = r.id();
@@ -518,23 +525,58 @@ public final class ScimGroupSync {
         }
 
         if (id.isEmpty() && displayName != null && !displayName.isBlank()) {
-            debug("resolveScimGroupId: externalId lookup empty, falling back to displayName=%s", displayName);
+            if (ScimTargetProviderFactory.LOOKUP_STRATEGY_NAME_ONLY.equals(strategy)) {
+                debug("resolveScimGroupId: strategy=name only, going straight to displayName=%s", displayName);
+            } else {
+                debug("resolveScimGroupId: externalId lookup empty, falling back to displayName=%s", displayName);
+            }
             id = client.findGroupIdByDisplayName(displayName);
         }
-        debug("resolveScimGroupId RESULT externalId=%s displayName=%s -> %s", externalId, displayName, id.orElse("<none>"));
+
+        debug("resolveScimGroupId RESULT externalId=%s displayName=%s strategy=%s -> %s",
+                externalId, displayName, strategy, id.orElse("<none>"));
         return id;
     }
 
-    private static Optional<String> resolveScimUserId(ScimClient client, String externalId, String scimUserName) {
+    /**
+     * Resolve the SCIM user id for a Keycloak user.
+     *
+     * Behaviour is governed by CFG_LOOKUP_STRATEGY on the given target:
+     *
+     *   "externalId first" (default):
+     *     1. Query by externalId. If exactly one result is returned, use it.
+     *     2. If the result is empty or ambiguous (totalResults != 1), fall back to userName.
+     *
+     *   "name only":
+     *     Skip the externalId HTTP call entirely. Go straight to userName lookup.
+     *     Use this when the SCIM server ignores the externalId filter.
+     */
+    private static Optional<String> resolveScimUserId(ScimClient client, ComponentModel target,
+                                                       String externalId, String scimUserName) {
         debug("resolveScimUserId CALL externalId=%s scimUserName=%s", externalId, scimUserName);
-        Optional<String> id = (externalId != null && !externalId.isBlank())
-                ? client.findUserIdByExternalId(externalId)
-                : Optional.empty();
+
+        String strategy = ScimTargetProviderFactory.get(target,
+                ScimTargetProviderFactory.CFG_LOOKUP_STRATEGY,
+                ScimTargetProviderFactory.LOOKUP_STRATEGY_EXTERNAL_ID_FIRST);
+
+        Optional<String> id = Optional.empty();
+
+        if (!ScimTargetProviderFactory.LOOKUP_STRATEGY_NAME_ONLY.equals(strategy)
+                && externalId != null && !externalId.isBlank()) {
+            id = client.findUserIdByExternalId(externalId);
+        }
+
         if (id.isEmpty() && scimUserName != null && !scimUserName.isBlank()) {
-            debug("resolveScimUserId: externalId lookup empty, falling back to userName=%s", scimUserName);
+            if (ScimTargetProviderFactory.LOOKUP_STRATEGY_NAME_ONLY.equals(strategy)) {
+                debug("resolveScimUserId: strategy=name only, going straight to userName=%s", scimUserName);
+            } else {
+                debug("resolveScimUserId: externalId lookup empty, falling back to userName=%s", scimUserName);
+            }
             id = client.findUserIdByUserName(scimUserName);
         }
-        debug("resolveScimUserId RESULT externalId=%s scimUserName=%s -> %s", externalId, scimUserName, id.orElse("<none>"));
+
+        debug("resolveScimUserId RESULT externalId=%s scimUserName=%s strategy=%s -> %s",
+                externalId, scimUserName, strategy, id.orElse("<none>"));
         return id;
     }
 
