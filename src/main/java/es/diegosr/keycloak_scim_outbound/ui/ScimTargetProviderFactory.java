@@ -102,6 +102,25 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
      */
     public static final String CFG_GROUP_MEMBER_REMOVE_FORM = "groupMemberRemoveForm";
 
+    /**
+     * ID lookup strategy controlling how SCIM entity IDs are resolved for both
+     * /Users and /Groups. A single key governs both user and group resolution.
+     *
+     * "externalId first" (default): query SCIM by externalId filter first.
+     *   If exactly one result is returned, use it. If zero or more than one result
+     *   is returned, fall back to userName (for users) or displayName (for groups).
+     *
+     * "name only": skip the externalId HTTP call entirely. Go straight to userName
+     *   (for /Users) or displayName (for /Groups). Use this when the SCIM server
+     *   ignores the externalId filter and returns the full user/group list regardless
+     *   -- avoids a wasted HTTP round trip per resolved entity.
+     */
+    public static final String CFG_LOOKUP_STRATEGY = "lookupStrategy";
+
+    /** Strategy value constants -- used by ScimGroupSync and ScimMembershipSync. */
+    public static final String LOOKUP_STRATEGY_EXTERNAL_ID_FIRST = "externalId first";
+    public static final String LOOKUP_STRATEGY_NAME_ONLY         = "name only";
+
     private static ProviderConfigProperty list(String help, String name, List<String> options, String def, boolean required) {
         ProviderConfigProperty p = new ProviderConfigProperty();
         p.setType(ProviderConfigProperty.LIST_TYPE);
@@ -131,6 +150,16 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
         list("Deprovisioning behavior when a user is deleted or removed from the filter group: "
             + "'deactivate' (PATCH active=false, default) or 'delete' (DELETE /Users/{id}).",
             CFG_DEPROVISION, List.of("deactivate","delete"), "deactivate", true),
+
+        list("SCIM ID lookup strategy for both /Users and /Groups resolution. "
+            + "'externalId first' (default): query by externalId filter first, fall back to "
+            + "userName/displayName on miss or ambiguous result. "
+            + "'name only': skip the externalId HTTP call entirely and go straight to "
+            + "userName (users) or displayName (groups). "
+            + "Use 'name only' when the SCIM server ignores the externalId filter.",
+            CFG_LOOKUP_STRATEGY,
+            List.of(LOOKUP_STRATEGY_EXTERNAL_ID_FIRST, LOOKUP_STRATEGY_NAME_ONLY),
+            LOOKUP_STRATEGY_EXTERNAL_ID_FIRST, true),
 
         prop(ProviderConfigProperty.BOOLEAN_TYPE, CFG_SYNC_GROUPS,
             "Enable SCIM /Groups sync. When true, group create/update/delete and membership changes "
@@ -285,8 +314,8 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
                         ScimGroupSync.processFullGroupSync(session, realm, model.getId());
                     } else {
                         // Delta provision only or Delta provision and deprovision.
-                        // ScimGroupSync reads CFG_GROUP_MEMBER_REMOVE_FORM directly from the
-                        // ComponentModel (target) at each remove call site -- no need to pass it here.
+                        // ScimGroupSync reads CFG_GROUP_MEMBER_REMOVE_FORM and CFG_LOOKUP_STRATEGY
+                        // directly from the ComponentModel (target) at each call site.
                         ScimGroupSync.processPendingGroupMembershipChanges(
                                 session, realm, model.getId(), groupMode);
                     }
