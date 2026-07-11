@@ -2,6 +2,7 @@ package es.diegosr.keycloak_scim_outbound.ui;
 
 import es.diegosr.keycloak_scim_outbound.ldapsync.ScimGroupSync;
 import es.diegosr.keycloak_scim_outbound.ldapsync.ScimMembershipSync;
+import es.diegosr.keycloak_scim_outbound.util.ScimMapper;
 
 import org.keycloak.component.ComponentModel;
 import org.keycloak.component.ComponentValidationException;
@@ -85,6 +86,21 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
      */
     public static final String CFG_LDAP_GROUP_PROV_MODE = "ldapGroupProvMode";
 
+    /**
+     * SCIM PATCH remove form for group membership changes.
+     * Controls the payload shape used when removing a single member from a SCIM group.
+     *
+     * "RFC 7644 path filter" (default, ScimMapper.REMOVE_FORM_RFC_PATH_FILTER):
+     *   {"op":"remove","path":"members[value eq \"<id>\"]"}
+     *   Spec-compliant per RFC 7644 s3.5.2. Some servers reject this without a value field.
+     *
+     * "Non-RFC value array" (ScimMapper.REMOVE_FORM_NON_RFC_VALUE_ARRAY):
+     *   {"op":"remove","path":"members","value":[{"value":"<id>"}]}
+     *   Not mandated by RFC 7644 for removes, but required by servers that validate
+     *   the presence of a value field on every operation.
+     */
+    public static final String CFG_GROUP_MEMBER_REMOVE_FORM = "groupMemberRemoveForm";
+
     private static ProviderConfigProperty list(String help, String name, List<String> options, String def, boolean required) {
         ProviderConfigProperty p = new ProviderConfigProperty();
         p.setType(ProviderConfigProperty.LIST_TYPE);
@@ -135,7 +151,16 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
             + "'Full' sends a complete member-list replace for all in-scope groups.",
             CFG_LDAP_GROUP_PROV_MODE,
             List.of(ScimGroupSync.MODE_DELTA_ONLY, ScimGroupSync.MODE_DELTA_DEPROVISION, ScimGroupSync.MODE_FULL),
-            ScimGroupSync.MODE_DELTA_ONLY, true)
+            ScimGroupSync.MODE_DELTA_ONLY, true),
+
+        list("SCIM PATCH remove form for group membership changes. "
+            + "'RFC 7644 path filter' uses the spec-compliant path-filter form "
+            + "(members[value eq \"<id>\"]). "
+            + "'Non-RFC value array' includes a value field on removes "
+            + "({\"value\":[{\"value\":\"<id>\"}]}) for servers that require it.",
+            CFG_GROUP_MEMBER_REMOVE_FORM,
+            List.of(ScimMapper.REMOVE_FORM_RFC_PATH_FILTER, ScimMapper.REMOVE_FORM_NON_RFC_VALUE_ARRAY),
+            ScimMapper.REMOVE_FORM_RFC_PATH_FILTER, true)
     );
 
     @Override
@@ -255,13 +280,16 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
                 // ---- Step 2: Group sync (only if CFG_SYNC_GROUPS = true) ----
                 if ("true".equalsIgnoreCase(get(model, CFG_SYNC_GROUPS, "false"))) {
                     String groupMode = get(model, CFG_LDAP_GROUP_PROV_MODE, ScimGroupSync.MODE_DELTA_ONLY);
+                    String removeForm = get(model, CFG_GROUP_MEMBER_REMOVE_FORM,
+                            ScimMapper.REMOVE_FORM_RFC_PATH_FILTER);
                     if (fullSync || ScimGroupSync.MODE_FULL.equals(groupMode)) {
                         ScimGroupSync.processFullGroupSync(session, realm, model.getId());
                     } else {
                         // Delta provision only or Delta provision and deprovision:
                         // processPendingGroupMembershipChanges reads the mode to decide
                         // whether to flush removes and whether to run the cross-check.
-                        ScimGroupSync.processPendingGroupMembershipChanges(session, realm, model.getId(), groupMode);
+                        ScimGroupSync.processPendingGroupMembershipChanges(
+                                session, realm, model.getId(), groupMode, removeForm);
                     }
                 }
             });
