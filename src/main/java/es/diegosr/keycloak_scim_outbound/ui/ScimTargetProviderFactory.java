@@ -32,6 +32,8 @@ import java.util.List;
  *   Step 1 -- User sync (always before group sync, so SCIM user IDs exist by the time
  *              group sync resolves member IDs)
  *   Step 2 -- Group sync (only if CFG_SYNC_GROUPS = true)
+ *   Step 3 -- Group deprovision sweep (only if CFG_SYNC_GROUPS = true): delete remote
+ *              SCIM groups whose KC group name no longer matches the scope filter
  *
  * For each step, the provisioning mode (Delta or Full) is controlled by:
  *   CFG_LDAP_USER_PROV_MODE  -- "Delta" (default) or "Full" for /Users
@@ -279,7 +281,7 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
     }
 
     /**
-     * Runs the user sync sweep followed by (optionally) the group sync sweep.
+     * Runs the user sync sweep, then the group sync sweep, then the group deprovision sweep.
      *
      * @param fullSync true when called from sync() (Synchronize all); false for syncSince()
      *                 (Synchronize changed users). When true, always uses full-sync mode for
@@ -319,6 +321,13 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
                         ScimGroupSync.processPendingGroupMembershipChanges(
                                 session, realm, model.getId(), groupMode);
                     }
+                }
+
+                // ---- Step 3: Group deprovision sweep (only if CFG_SYNC_GROUPS = true) ----
+                // Runs unconditionally after group sync, regardless of provisioning mode.
+                // Deletes remote SCIM groups whose KC group name no longer matches the scope filter.
+                if ("true".equalsIgnoreCase(get(model, CFG_SYNC_GROUPS, "false"))) {
+                    ScimGroupSync.deprovisionOutOfScopeGroups(session, realm, model.getId());
                 }
             });
             info("Manual sync for target=%s completed in %dms", model.getName(), System.currentTimeMillis() - start);
