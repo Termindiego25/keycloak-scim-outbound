@@ -155,6 +155,8 @@ public final class ScimMembershipSync {
 
                     try {
                         if (entry.state() == MembershipState.State.NEW_ADDED) {
+                            debug("Calling upsertUser: user=%s scimUserName=%s target=%s groupId=%s",
+                                    user.getUsername(), scimUserName, target.getName(), entry.groupId());
                             boolean ok = upsertUser(client, user, scimUserName);
                             if (ok) {
                                 updatedValues.remove(rawValue);
@@ -171,6 +173,8 @@ public final class ScimMembershipSync {
                                         user.getUsername(), target.getName(), entry.groupId());
                             }
                         } else if (entry.state() == MembershipState.State.NEW_DELETED) {
+                            debug("Calling deprovisionUser: user=%s scimUserName=%s target=%s groupId=%s",
+                                    user.getUsername(), scimUserName, target.getName(), entry.groupId());
                             boolean ok = deprovisionUser(target, client, user.getId(), scimUserName);
                             if (ok) {
                                 updatedValues.remove(rawValue);
@@ -307,6 +311,8 @@ public final class ScimMembershipSync {
                     continue;
                 }
                 try {
+                    debug("Calling upsertUser (full): user=%s scimUserName=%s target=%s",
+                            user.getUsername(), scimUserName, target.getName());
                     boolean ok = upsertUser(client, user, scimUserName);
                     if (ok) {
                         usersUpserted++;
@@ -336,6 +342,8 @@ public final class ScimMembershipSync {
             for (UserModel user : previouslyProvisioned) {
                 String scimUserName = computeScimUserName(target, user);
                 try {
+                    debug("Calling deprovisionUser (full): user=%s scimUserName=%s target=%s",
+                            user.getUsername(), scimUserName, target.getName());
                     boolean ok = deprovisionUser(target, client, user.getId(), scimUserName);
                     if (ok) {
                         usersDeprovisioned++;
