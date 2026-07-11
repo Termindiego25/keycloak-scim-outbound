@@ -89,6 +89,7 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
     /**
      * SCIM PATCH remove form for group membership changes.
      * Controls the payload shape used when removing a single member from a SCIM group.
+     * Read directly by ScimGroupSync from the ComponentModel at each call site.
      *
      * "RFC 7644 path filter" (default, ScimMapper.REMOVE_FORM_RFC_PATH_FILTER):
      *   {"op":"remove","path":"members[value eq \"<id>\"]"}
@@ -280,16 +281,14 @@ public class ScimTargetProviderFactory implements UserStorageProviderFactory<Sci
                 // ---- Step 2: Group sync (only if CFG_SYNC_GROUPS = true) ----
                 if ("true".equalsIgnoreCase(get(model, CFG_SYNC_GROUPS, "false"))) {
                     String groupMode = get(model, CFG_LDAP_GROUP_PROV_MODE, ScimGroupSync.MODE_DELTA_ONLY);
-                    String removeForm = get(model, CFG_GROUP_MEMBER_REMOVE_FORM,
-                            ScimMapper.REMOVE_FORM_RFC_PATH_FILTER);
                     if (fullSync || ScimGroupSync.MODE_FULL.equals(groupMode)) {
                         ScimGroupSync.processFullGroupSync(session, realm, model.getId());
                     } else {
-                        // Delta provision only or Delta provision and deprovision:
-                        // processPendingGroupMembershipChanges reads the mode to decide
-                        // whether to flush removes and whether to run the cross-check.
+                        // Delta provision only or Delta provision and deprovision.
+                        // ScimGroupSync reads CFG_GROUP_MEMBER_REMOVE_FORM directly from the
+                        // ComponentModel (target) at each remove call site -- no need to pass it here.
                         ScimGroupSync.processPendingGroupMembershipChanges(
-                                session, realm, model.getId(), groupMode, removeForm);
+                                session, realm, model.getId(), groupMode);
                     }
                 }
             });
