@@ -39,9 +39,9 @@ public final class ScimGroupSync {
      * Mode values for CFG_LDAP_GROUP_PROV_MODE.
      * Must stay in sync with the list options in ScimTargetProviderFactory.PROPS.
      */
-    static final String MODE_DELTA_ONLY        = "Delta provision only";
-    static final String MODE_DELTA_DEPROVISION = "Delta provision and deprovision";
-    static final String MODE_FULL              = "Full";
+    public static final String MODE_DELTA_ONLY        = "Delta provision only";
+    public static final String MODE_DELTA_DEPROVISION = "Delta provision and deprovision";
+    public static final String MODE_FULL              = "Full";
 
     private ScimGroupSync() {}
 
