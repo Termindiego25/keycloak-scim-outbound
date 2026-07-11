@@ -336,11 +336,34 @@ public final class ScimGroupSync {
                 .toList();
     }
 
+    /**
+     * Resolve the SCIM group id for a Keycloak group.
+     *
+     * Strategy:
+     * 1. Query by externalId. If exactly one result is returned, use it.
+     * 2. If zero results: group not found by externalId, fall through to displayName.
+     * 3. If more than one result: the SCIM server returned an ambiguous match for a
+     *    UUID-based filter (server-side data issue). Do not pick an arbitrary match --
+     *    fall back to displayName lookup and log a warning.
+     */
     private static Optional<String> resolveScimGroupId(ScimClient client, String externalId, String displayName) {
         debug("resolveScimGroupId CALL externalId=%s displayName=%s", externalId, displayName);
-        Optional<String> id = (externalId != null && !externalId.isBlank())
-                ? client.findGroupIdByExternalId(externalId)
-                : Optional.empty();
+
+        Optional<String> id = Optional.empty();
+        if (externalId != null && !externalId.isBlank()) {
+            ScimClient.ScimLookupResult r = client.findGroupByExternalId(externalId);
+            if (r.totalResults() == 1) {
+                id = r.id();
+            } else if (r.totalResults() > 1) {
+                // Ambiguous: the SCIM server returned multiple groups for a UUID-based
+                // externalId filter. This indicates a server-side data issue.
+                // Do not pick an arbitrary match -- fall back to displayName lookup.
+                debug("resolveScimGroupId: externalId=%s returned %d results (ambiguous), falling back to displayName",
+                        externalId, r.totalResults());
+            }
+            // totalResults == 0: not found, fall through to displayName
+        }
+
         if (id.isEmpty() && displayName != null && !displayName.isBlank()) {
             debug("resolveScimGroupId: externalId lookup empty, falling back to displayName=%s", displayName);
             id = client.findGroupIdByDisplayName(displayName);
