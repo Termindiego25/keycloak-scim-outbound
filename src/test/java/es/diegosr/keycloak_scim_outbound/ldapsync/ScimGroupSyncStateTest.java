@@ -97,7 +97,7 @@ class ScimGroupSyncStateTest {
         // group name lookup for resolveInScopeGroups
         lenient().when(groupProvider.searchForGroupByNameStream(
                 eq(realm), eq(GROUP_NAME), eq(true), isNull(), isNull()))
-                 .thenReturn(Stream.of(group));
+                 .thenAnswer(inv -> Stream.of(group));
 
         // SCIM group lookup
         lenient().when(client.findGroupByExternalId(GROUP_ID))
@@ -125,9 +125,9 @@ class ScimGroupSyncStateTest {
         String pendingFlag = GroupMembershipState.pendingValue(TARGET_ID);
 
         when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(pendingFlag));
+                .thenAnswer(inv -> Stream.of(pendingFlag));
         when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(addEntry));
+                .thenAnswer(inv -> Stream.of(addEntry));
         when(session.users().getUserById(realm, USER_ID)).thenReturn(user);
         when(client.patchGroup(eq(SCIM_GRP_ID), anyString())).thenReturn(true);
 
@@ -164,9 +164,9 @@ class ScimGroupSyncStateTest {
         String pendingFlag = GroupMembershipState.pendingValue(TARGET_ID);
 
         when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(pendingFlag));
+                .thenAnswer(inv -> Stream.of(pendingFlag));
         when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(delEntry));
+                .thenAnswer(inv -> Stream.of(delEntry));
 
         ScimGroupSync.processPendingGroupMembershipChanges(
                 session, realm, TARGET_ID, ScimGroupSync.MODE_DELTA_ONLY);
@@ -186,9 +186,9 @@ class ScimGroupSyncStateTest {
         String pendingFlag = GroupMembershipState.pendingValue(TARGET_ID);
 
         when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(pendingFlag));
+                .thenAnswer(inv -> Stream.of(pendingFlag));
         when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(delEntry));
+                .thenAnswer(inv -> Stream.of(delEntry));
         when(session.users().getUserById(realm, USER_ID)).thenReturn(user);
         when(client.patchGroup(eq(SCIM_GRP_ID), anyString())).thenReturn(true);
 
@@ -220,9 +220,9 @@ class ScimGroupSyncStateTest {
         String pendingFlag = GroupMembershipState.pendingValue(TARGET_ID);
 
         when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(pendingFlag));
+                .thenAnswer(inv -> Stream.of(pendingFlag));
         when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(addEntry));
+                .thenAnswer(inv -> Stream.of(addEntry));
         when(session.users().getUserById(realm, USER_ID)).thenReturn(user);
         when(client.patchGroup(anyString(), anyString())).thenReturn(false);
 
@@ -243,9 +243,9 @@ class ScimGroupSyncStateTest {
         String pendingFlag = GroupMembershipState.pendingValue(TARGET_ID);
 
         when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(pendingFlag));
+                .thenAnswer(inv -> Stream.of(pendingFlag));
         when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(sentEntry));
+                .thenAnswer(inv -> Stream.of(sentEntry));
 
         ScimGroupSync.processPendingGroupMembershipChanges(
                 session, realm, TARGET_ID, ScimGroupSync.MODE_DELTA_ONLY);
@@ -261,7 +261,7 @@ class ScimGroupSyncStateTest {
     void delta_crossCheckNotCalledInDeltaOnly() {
         // group has no pending entries -- nothing to flush, but cross-check must not run
         when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
-                .thenReturn(Stream.of());
+                .thenAnswer(inv -> Stream.of());
 
         ScimGroupSync.processPendingGroupMembershipChanges(
                 session, realm, TARGET_ID, ScimGroupSync.MODE_DELTA_ONLY);
@@ -293,9 +293,9 @@ class ScimGroupSyncStateTest {
     void fullSync_allMembersResolved_patchSent() {
         when(userProvider.getGroupMembersStream(realm, group)).thenReturn(Stream.of(user));
         when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
-                .thenReturn(Stream.of());
+                .thenAnswer(inv -> Stream.of());
         when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
-                .thenReturn(Stream.of());
+                .thenAnswer(inv -> Stream.of());
         when(client.patchGroup(eq(SCIM_GRP_ID), anyString())).thenReturn(true);
 
         ScimGroupSync.processFullGroupSync(session, realm, TARGET_ID);
@@ -313,9 +313,9 @@ class ScimGroupSyncStateTest {
         // group is "previously provisioned" (has state for this target)
         when(groupProvider.getGroupsStream(realm)).thenReturn(Stream.of(group));
         when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(sentEntry));
+                .thenAnswer(inv -> Stream.of(sentEntry));
         when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
-                .thenReturn(Stream.of());
+                .thenAnswer(inv -> Stream.of());
         // group is out of scope: CFG_FILTER_GROUP=engineering but group name is "old-group"
         when(group.getName()).thenReturn("old-group");
         when(client.deleteGroup(SCIM_GRP_ID)).thenReturn(true);
@@ -345,9 +345,9 @@ class ScimGroupSyncStateTest {
         String sentEntry = new GroupMembershipState(TARGET_ID, USER_ID, SENT).toValue();
         when(groupProvider.getGroupsStream(realm)).thenReturn(Stream.of(group));
         when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(sentEntry));
+                .thenAnswer(inv -> Stream.of(sentEntry));
         when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
-                .thenReturn(Stream.of());
+                .thenAnswer(inv -> Stream.of());
         when(group.getName()).thenReturn("old-group");
         when(client.deleteGroup(SCIM_GRP_ID)).thenReturn(false);
 
@@ -367,9 +367,9 @@ class ScimGroupSyncStateTest {
 
         when(userProvider.getGroupMembersStream(realm, group)).thenReturn(Stream.of(user));
         when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(otherTargetEntry));
+                .thenAnswer(inv -> Stream.of(otherTargetEntry));
         when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
-                .thenReturn(Stream.of());
+                .thenAnswer(inv -> Stream.of());
         when(client.patchGroup(eq(SCIM_GRP_ID), anyString())).thenReturn(true);
 
         ScimGroupSync.processFullGroupSync(session, realm, TARGET_ID);
