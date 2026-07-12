@@ -94,7 +94,7 @@ public final class ScimGroupSync {
             return;
         }
 
-        boolean flushDeletes = MODE_DELTA_DEPROVISION.equals(mode);
+        boolean flushDeletes  = MODE_DELTA_DEPROVISION.equals(mode);
         boolean runCrossCheck = MODE_DELTA_DEPROVISION.equals(mode);
 
         int groupsProcessed = 0;
@@ -277,7 +277,6 @@ public final class ScimGroupSync {
             List<GroupModel> inScopeGroups = resolveInScopeGroups(session, realm, target);
             LOG.debugf("Target=%s: %d in-scope group(s) for full sync.", target.getName(), inScopeGroups.size());
 
-            // Collect filter-group member IDs for the scope intersection check.
             String filterGroupName = ScimTargetProviderFactory.get(
                     target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
             Set<String> scopedUserIds = new HashSet<>();
@@ -336,7 +335,6 @@ public final class ScimGroupSync {
                     if (ok) {
                         LOG.infof("FULL SYNC group=%s target=%s members=%d -> OK",
                                 group.getName(), target.getName(), scimMemberIds.size());
-                        // Transition state: mark resolved members as SENT, drop stale deletes.
                         transitionGroupStateAfterFullSync(group, target.getId(),
                                 scimMemberIds, groupMembers, scopedUserIds, filterGroupName);
                     } else {
@@ -366,9 +364,6 @@ public final class ScimGroupSync {
      *   - Remove any NEW_DELETED entry (removal was implicit in the replace).
      *   - Leave SENT entries intact -- they remain valid.
      * The pending flag is cleared when no non-SENT entries remain.
-     *
-     * scimMemberIds is parallel to the resolved members list but we work from the
-     * full groupMembers list to determine who was included vs excluded.
      */
     private static void transitionGroupStateAfterFullSync(
             GroupModel group, String componentId,
@@ -377,7 +372,6 @@ public final class ScimGroupSync {
             Set<String> scopedUserIds,
             String filterGroupName) {
 
-        // Build the set of KC user IDs that were included in the replace.
         Set<String> includedUserIds = new HashSet<>();
         for (UserModel m : groupMembers) {
             if (filterGroupName != null && !filterGroupName.isBlank()
@@ -391,17 +385,13 @@ public final class ScimGroupSync {
                 group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME).toList());
         List<String> updated = new ArrayList<>();
 
-        // Preserve entries for other targets unchanged.
         for (String raw : current) {
             Optional<GroupMembershipState> parsed = GroupMembershipState.parse(raw);
             if (parsed.isEmpty() || !parsed.get().componentId().equals(componentId)) {
                 updated.add(raw);
             }
-            // Entries for this target are rebuilt below.
         }
 
-        // Re-add entries for this target with correct post-sync state.
-        // Included members -> SENT. Excluded members -> remove NEW_DELETED, keep SENT.
         Set<String> wroteUserIds = new HashSet<>();
         for (String raw : current) {
             Optional<GroupMembershipState> parsed = GroupMembershipState.parse(raw);
@@ -410,26 +400,22 @@ public final class ScimGroupSync {
             String uid = entry.userId();
 
             if (includedUserIds.contains(uid)) {
-                // Was included in the replace -> SENT.
                 if (!wroteUserIds.contains(uid)) {
                     updated.add(new GroupMembershipState(componentId, uid,
                             GroupMembershipState.State.SENT).toValue());
                     wroteUserIds.add(uid);
                 }
             } else {
-                // Not included (out of scope). Drop NEW_DELETED (implicit); keep SENT.
                 if (entry.state() == GroupMembershipState.State.SENT) {
                     updated.add(raw);
                 }
-                // NEW_DELETED dropped intentionally; NEW_ADDED left: should not occur
-                // for out-of-scope members but preserve defensively.
+                // NEW_DELETED dropped intentionally; NEW_ADDED preserved defensively.
                 if (entry.state() == GroupMembershipState.State.NEW_ADDED) {
                     updated.add(raw);
                 }
             }
         }
 
-        // Add SENT entries for included members that had no prior state entry.
         for (UserModel m : groupMembers) {
             if (filterGroupName != null && !filterGroupName.isBlank()
                     && !scopedUserIds.contains(m.getId())) {
@@ -499,7 +485,6 @@ public final class ScimGroupSync {
             List<String> remoteScimUserIds = client.getGroupMembers(scimGroupId);
             if (remoteScimUserIds.isEmpty()) continue;
 
-            // Resolve local SCIM user IDs. Abort removals for this group if any lookup fails.
             List<UserModel> groupMembers = session.users()
                     .getGroupMembersStream(realm, group).toList();
             Set<String> localScimUserIds = new HashSet<>();
@@ -596,8 +581,6 @@ public final class ScimGroupSync {
             }
             ScimClient client = clientFactory.apply(base, token);
 
-            // Full group-stream scan is acceptable: group counts are small (tens to low hundreds)
-            // and Keycloak has no indexed group-attribute search API.
             List<GroupModel> previouslyProvisioned = session.groups()
                     .getGroupsStream(realm)
                     .filter(g -> {
@@ -716,7 +699,6 @@ public final class ScimGroupSync {
                 t, ScimTargetProviderFactory.CFG_SYNC_GROUPS_FILTER_REGEX, "false"));
 
         if (filter == null || filter.isBlank()) {
-            // No filter set: fall back to single CFG_FILTER_GROUP exact match.
             String filterGroup = ScimTargetProviderFactory.get(t, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
             return groupName.equals(filterGroup);
         }
@@ -730,7 +712,6 @@ public final class ScimGroupSync {
             }
         }
 
-        // Comma-delimited exact match (default).
         for (String part : filter.split(",")) {
             if (groupName.equals(part.trim())) return true;
         }
@@ -777,7 +758,6 @@ public final class ScimGroupSync {
                     .collect(Collectors.toList());
         }
 
-        // Comma-delimited: look up each name individually.
         List<GroupModel> result = new ArrayList<>();
         for (String part : filter.split(",")) {
             String name = part.trim();
