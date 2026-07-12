@@ -184,7 +184,7 @@ class ScimMembershipSyncStateTest {
         when(user.getAttributeStream(MembershipState.ATTRIBUTE_NAME)).thenAnswer(inv -> Stream.empty());
         when(user.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME)).thenAnswer(inv -> Stream.empty());
         when(localUserProvider.getUserById(realm, USER_ID)).thenReturn(localUser);
-        when(localUser.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME)).thenAnswer(inv -> Stream.empty());
+        lenient().when(localUser.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME)).thenAnswer(inv -> Stream.empty());
 
         ScimMembershipSync.processFullUserSync(session, realm, TARGET_ID);
 
@@ -220,7 +220,7 @@ class ScimMembershipSyncStateTest {
                 .thenAnswer(inv -> Stream.of(sentValue));
         when(user.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME)).thenAnswer(inv -> Stream.empty());
         when(localUserProvider.getUserById(realm, USER_ID)).thenReturn(localUser);
-        when(localUser.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME)).thenAnswer(inv -> Stream.empty());
+        lenient().when(localUser.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME)).thenAnswer(inv -> Stream.empty());
 
         ScimMembershipSync.processFullUserSync(session, realm, TARGET_ID);
 
