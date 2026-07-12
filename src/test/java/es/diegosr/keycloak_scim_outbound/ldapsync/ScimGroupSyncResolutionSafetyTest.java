@@ -112,7 +112,7 @@ class ScimGroupSyncResolutionSafetyTest {
         when(userProvider.getGroupMembersStream(realm, group))
                 .thenReturn(Stream.of(userA, userB));
 
-        ScimClient.ScimLookupResult foundGrp = new ScimClient.ScimLookupResult(1, Optional.of(SCIM_GRP_ID));
+        ScimClient.ScimLookupResult foundGrp = new ScimClient.ScimLookupResult(Optional.of(SCIM_GRP_ID), 1);
         when(client.findGroupByExternalId(GROUP_ID)).thenReturn(foundGrp);
 
         when(client.findUserIdByExternalId(USER_A_ID)).thenReturn(Optional.of(SCIM_A_ID));
@@ -129,7 +129,7 @@ class ScimGroupSyncResolutionSafetyTest {
         when(userProvider.getGroupMembersStream(realm, group))
                 .thenReturn(Stream.of(userA));
 
-        ScimClient.ScimLookupResult foundGrp = new ScimClient.ScimLookupResult(1, Optional.of(SCIM_GRP_ID));
+        ScimClient.ScimLookupResult foundGrp = new ScimClient.ScimLookupResult(Optional.of(SCIM_GRP_ID), 1);
         when(client.findGroupByExternalId(GROUP_ID)).thenReturn(foundGrp);
         when(client.findUserIdByExternalId(USER_A_ID)).thenReturn(Optional.of(SCIM_A_ID));
         when(client.patchGroup(eq(SCIM_GRP_ID), any())).thenReturn(true);
@@ -161,14 +161,14 @@ class ScimGroupSyncResolutionSafetyTest {
         // group1: userB unresolvable -> abort
         when(userProvider.getGroupMembersStream(realm, group)).thenReturn(Stream.of(userB));
         when(client.findGroupByExternalId(GROUP_ID))
-                .thenReturn(new ScimClient.ScimLookupResult(1, Optional.of(SCIM_GRP_ID)));
+                .thenReturn(new ScimClient.ScimLookupResult(Optional.of(SCIM_GRP_ID), 1));
         when(client.findUserIdByExternalId(USER_B_ID)).thenReturn(Optional.empty());
         when(client.findUserIdByUserName("bob")).thenReturn(Optional.empty());
 
         // group2: no members -> replace with empty list should succeed
         when(userProvider.getGroupMembersStream(realm, group2)).thenReturn(Stream.empty());
         when(client.findGroupByExternalId("kc-group-2"))
-                .thenReturn(new ScimClient.ScimLookupResult(1, Optional.of("scim-grp-2")));
+                .thenReturn(new ScimClient.ScimLookupResult(Optional.of("scim-grp-2"), 1));
         when(client.patchGroup(eq("scim-grp-2"), any())).thenReturn(true);
 
         ScimGroupSync.processFullGroupSync(session, realm, TARGET_ID);
@@ -191,7 +191,7 @@ class ScimGroupSyncResolutionSafetyTest {
                 .thenReturn(Stream.empty());
 
         // Remote has one member
-        ScimClient.ScimLookupResult foundGrp = new ScimClient.ScimLookupResult(1, Optional.of(SCIM_GRP_ID));
+        ScimClient.ScimLookupResult foundGrp = new ScimClient.ScimLookupResult(Optional.of(SCIM_GRP_ID), 1);
         when(client.findGroupByExternalId(GROUP_ID)).thenReturn(foundGrp);
         when(client.getGroupMembers(SCIM_GRP_ID)).thenReturn(List.of("scim-remote-1"));
 
@@ -215,7 +215,7 @@ class ScimGroupSyncResolutionSafetyTest {
 
         // resolveScimGroupId returns empty for both strategies
         when(client.findGroupByExternalId(GROUP_ID))
-                .thenReturn(new ScimClient.ScimLookupResult(0, Optional.empty()));
+                .thenReturn(new ScimClient.ScimLookupResult(Optional.empty(), 0));
         when(client.findGroupIdByDisplayName(GROUP_NAME)).thenReturn(Optional.empty());
 
         ScimGroupSync.processPendingGroupMembershipChanges(
@@ -235,7 +235,7 @@ class ScimGroupSyncResolutionSafetyTest {
 
         // externalId returns 2 results (ambiguous)
         when(client.findGroupByExternalId(GROUP_ID))
-                .thenReturn(new ScimClient.ScimLookupResult(2, Optional.empty()));
+                .thenReturn(new ScimClient.ScimLookupResult(Optional.empty(), 2));
         // displayName lookup succeeds
         when(client.findGroupIdByDisplayName(GROUP_NAME)).thenReturn(Optional.of(SCIM_GRP_ID));
         when(client.patchGroup(eq(SCIM_GRP_ID), any())).thenReturn(true);
