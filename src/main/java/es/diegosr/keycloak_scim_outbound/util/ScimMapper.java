@@ -5,8 +5,11 @@ import org.keycloak.models.UserModel;
 import java.util.List;
 
 /**
- * Builds SCIM v2 User payloads from Keycloak's UserModel.
- * Keep all string escaping / normalization here.
+ * Builds SCIM v2 payloads (Users and Groups) from Keycloak models.
+ *
+ * All JSON is assembled via Java text blocks. No raw string concatenation is
+ * used to construct JSON structure -- only %s slots inside text blocks, or a
+ * StringBuilder for variable-length Operations / value arrays.
  */
 public final class ScimMapper {
 
@@ -15,43 +18,47 @@ public final class ScimMapper {
     /**
      * Group member remove form options (CFG_GROUP_MEMBER_REMOVE_FORM).
      *
-     * RFC_PATH_FILTER -- RFC 7644 path filter:
+     * REMOVE_FORM_RFC_PATH_FILTER (default, spec-compliant):
      *   {"op":"remove","path":"members[value eq \"<id>\"]"}
-     *   Spec-compliant; some servers do not accept it without a value field.
+     *   RFC 7644 s3.5.2. Some servers reject this without a value field.
      *
-     * NON_RFC_VALUE_ARRAY -- Non-RFC value array:
+     * REMOVE_FORM_NON_RFC_VALUE_ARRAY:
      *   {"op":"remove","path":"members","value":[{"value":"<id>"}]}
-     *   Not mandated by RFC 7644 for removes but accepted by servers that
-     *   require a value field on every operation (e.g. this deployment's target).
+     *   Not mandated by RFC 7644 for removes, but required by servers that
+     *   validate the presence of a value field on every operation.
      */
-    public static final String REMOVE_FORM_RFC_PATH_FILTER    = "RFC 7644 path filter";
+    public static final String REMOVE_FORM_RFC_PATH_FILTER     = "RFC 7644 path filter";
     public static final String REMOVE_FORM_NON_RFC_VALUE_ARRAY = "Non-RFC value array";
 
-    /** Backward-compatible wrapper: uses Keycloak username if no explicit SCIM userName is provided. */
+    // =========================================================================
+    // Users
+    // =========================================================================
+
+    /** Backward-compatible wrapper: uses Keycloak username as SCIM userName. */
     public static String buildCreateUser(UserModel user) {
         String fallback = user != null ? user.getUsername() : "";
         return buildCreateUser(user, fallback);
     }
 
-    /** Build SCIM User JSON for POST /Users with explicit SCIM userName (strategy-based). */
+    /** Build SCIM User JSON for POST /Users with an explicit SCIM userName. */
     public static String buildCreateUser(UserModel user, String scimUserName) {
-        final String given     = esc(nvl(user != null ? user.getFirstName()  : null));
-        final String family    = esc(nvl(user != null ? user.getLastName()   : null));
-        final String email     = esc(nvl(user != null ? user.getEmail()      : null));
-        final String uname     = esc(nvl(scimUserName));
-        final String extId     = esc(nvl(user != null ? user.getId()         : null));
-        final String active    = (user != null && user.isEnabled()) ? "true" : "false";
+        final String given  = esc(nvl(user != null ? user.getFirstName() : null));
+        final String family = esc(nvl(user != null ? user.getLastName()  : null));
+        final String email  = esc(nvl(user != null ? user.getEmail()     : null));
+        final String uname  = esc(nvl(scimUserName));
+        final String extId  = esc(nvl(user != null ? user.getId()        : null));
+        final String active = (user != null && user.isEnabled()) ? "true" : "false";
 
         return """
-            {
-              "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
-              "externalId": "%s",
-              "userName": "%s",
-              "name": { "givenName": "%s", "familyName": "%s" },
-              "emails": [ { "value": "%s", "type": "work", "primary": true } ],
-              "active": %s
-            }
-            """.formatted(extId, uname, given, family, email, active);
+                {
+                  "schemas": ["urn:ietf:params:scim:schemas:core:2.0:User"],
+                  "externalId": "%s",
+                  "userName": "%s",
+                  "name": { "givenName": "%s", "familyName": "%s" },
+                  "emails": [ { "value": "%s", "type": "work", "primary": true } ],
+                  "active": %s
+                }
+                """.formatted(extId, uname, given, family, email, active);
     }
 
     /** Backward-compatible wrapper: PATCH without touching externalId. */
@@ -61,8 +68,12 @@ public final class ScimMapper {
 
     /**
      * Build SCIM PatchOp JSON for PATCH /Users/{id}.
-     * When {@code externalId} is provided, an "add" op is included so already-provisioned
-     * users that lack an externalId get one set on update/upsert.
+     *
+     * When externalId is non-null, an "add" op is prepended so already-provisioned
+     * users that lack an externalId get one set on the next update or upsert.
+     *
+     * The Operations list is variable-length, so it is assembled with a StringBuilder.
+     * The surrounding envelope uses a text block with a %s slot.
      */
     public static String buildPatchUser(UserModel user, String externalId) {
         final String given  = esc(nvl(user != null ? user.getFirstName() : null));
@@ -73,155 +84,176 @@ public final class ScimMapper {
 
         StringBuilder ops = new StringBuilder();
         if (!extId.isEmpty()) {
-            ops.append("    {\"op\":\"add\",\"path\":\"externalId\",\"value\":\"").append(extId).append("\"},\n");
+            ops.append("    {\"op\":\"add\",\"path\":\"externalId\",\"value\":\"")
+               .append(extId).append("\"},\n");
         }
-        ops.append("    {\"op\":\"replace\",\"path\":\"name.givenName\",\"value\":\"").append(given).append("\"},\n");
-        ops.append("    {\"op\":\"replace\",\"path\":\"name.familyName\",\"value\":\"").append(family).append("\"},\n");
-        ops.append("    {\"op\":\"replace\",\"path\":\"emails[primary eq true].value\",\"value\":\"").append(email).append("\"},\n");
-        ops.append("    {\"op\":\"replace\",\"path\":\"active\",\"value\":").append(active).append("}");
+        ops.append("    {\"op\":\"replace\",\"path\":\"name.givenName\",\"value\":\"")
+           .append(given).append("\"},\n");
+        ops.append("    {\"op\":\"replace\",\"path\":\"name.familyName\",\"value\":\"")
+           .append(family).append("\"},\n");
+        ops.append("    {\"op\":\"replace\",\"path\":\"emails[primary eq true].value\",\"value\":\"")
+           .append(email).append("\"},\n");
+        ops.append("    {\"op\":\"replace\",\"path\":\"active\",\"value\":")
+           .append(active).append("}");
 
-        return "{\n"
-             + "  \"schemas\": [\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\n"
-             + "  \"Operations\": [\n"
-             + ops
-             + "\n  ]\n}\n";
+        return """
+                {
+                  "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                  "Operations": [
+                %s
+                  ]
+                }
+                """.formatted(ops);
     }
 
-    /** Patch to deactivate (active=false). */
+    /** Build SCIM PatchOp to deactivate a user (set active=false). */
     public static String buildDeactivatePatch() {
         return """
-            {
-              "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
-              "Operations": [
-                {"op":"replace","path":"active","value":false}
-              ]
-            }
-            """;
+                {
+                  "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                  "Operations": [
+                    {"op":"replace","path":"active","value":false}
+                  ]
+                }
+                """;
     }
 
-    /** Build SCIM Group JSON for POST /Groups. externalId should be the Keycloak group ID. */
+    // =========================================================================
+    // Groups
+    // =========================================================================
+
+    /**
+     * Build SCIM Group JSON for POST /Groups.
+     * externalId should be the Keycloak group UUID.
+     */
     public static String buildCreateGroup(String displayName, String externalId) {
         final String name  = esc(nvl(displayName));
         final String extId = esc(nvl(externalId));
         return """
-            {
-              "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
-              "externalId": "%s",
-              "displayName": "%s"
-            }
-            """.formatted(extId, name);
+                {
+                  "schemas": ["urn:ietf:params:scim:schemas:core:2.0:Group"],
+                  "externalId": "%s",
+                  "displayName": "%s"
+                }
+                """.formatted(extId, name);
     }
 
     /**
-     * Build PatchOp to add or remove a single member from a SCIM group.
+     * Build a SCIM PatchOp that adds or removes a single member from a group.
      *
      * The "add" operation always uses the standard path+value form (RFC 7644 s3.5.2):
      *   {"op":"add","path":"members","value":[{"value":"<id>"}]}
      *
-     * The "remove" operation form is controlled by the removeForm parameter:
+     * The "remove" operation form is controlled by removeForm:
      *
-     *   REMOVE_FORM_RFC_PATH_FILTER (default, spec-compliant):
+     *   REMOVE_FORM_RFC_PATH_FILTER (default):
      *     {"op":"remove","path":"members[value eq \"<id>\"]"}
      *
-     *   REMOVE_FORM_NON_RFC_VALUE_ARRAY (for servers that require a value field on removes):
+     *   REMOVE_FORM_NON_RFC_VALUE_ARRAY:
      *     {"op":"remove","path":"members","value":[{"value":"<id>"}]}
-     *
-     * Pass ScimTargetProviderFactory.get(target, CFG_GROUP_MEMBER_REMOVE_FORM,
-     * REMOVE_FORM_RFC_PATH_FILTER) as removeForm.
      *
      * @param op         "add" or "remove"
      * @param memberId   SCIM user id of the member
-     * @param removeForm one of REMOVE_FORM_RFC_PATH_FILTER or REMOVE_FORM_NON_RFC_VALUE_ARRAY;
-     *                   ignored when op is "add"
+     * @param removeForm one of the REMOVE_FORM_* constants; ignored when op is "add"
      */
     public static String buildGroupMemberPatch(String op, String memberId, String removeForm) {
-        final String escapedId = esc(nvl(memberId));
+        final String id = esc(nvl(memberId));
+
         if ("remove".equals(op)) {
             if (REMOVE_FORM_NON_RFC_VALUE_ARRAY.equals(removeForm)) {
-                // Non-RFC value array form: servers that reject path-filter removes
-                // without a value field accept this form instead.
-                return "{\n"
-                     + "  \"schemas\": [\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\n"
-                     + "  \"Operations\": [\n"
-                     + "    {\"op\":\"remove\",\"path\":\"members\",\"value\":[{\"value\":\""
-                     + escapedId
-                     + "\"}]}\n"
-                     + "  ]\n"
-                     + "}\n";
+                return """
+                        {
+                          "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                          "Operations": [
+                            {"op":"remove","path":"members","value":[{"value":"%s"}]}
+                          ]
+                        }
+                        """.formatted(id);
             }
-            // RFC 7644 path filter form (default)
-            return "{\n"
-                 + "  \"schemas\": [\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\n"
-                 + "  \"Operations\": [\n"
-                 + "    {\"op\":\"remove\",\"path\":\"members[value eq \\\""
-                 + escapedId
-                 + "\\\"]\"}\\n"
-                 + "  ]\n"
-                 + "}\n";
+            // RFC 7644 path filter form (default).
+            // The escaped quote inside the filter is a JSON string escape (\"), not a
+            // Java source escape -- text blocks handle the surrounding quoting cleanly.
+            return """
+                    {
+                      "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                      "Operations": [
+                        {"op":"remove","path":"members[value eq \\"%s\\"]"}
+                      ]
+                    }
+                    """.formatted(id);
         }
+
+        // "add"
         return """
-            {
-              "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
-              "Operations": [
-                {"op":"add","path":"members","value":[{"value":"%s"}]}
-              ]
-            }
-            """.formatted(escapedId);
+                {
+                  "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                  "Operations": [
+                    {"op":"add","path":"members","value":[{"value":"%s"}]}
+                  ]
+                }
+                """.formatted(id);
     }
 
     /**
      * Backward-compatible overload: uses RFC 7644 path filter form for removes.
-     * Retained for call sites that do not have access to a ComponentModel
-     * (e.g. ScimEventListenerProvider). New call sites should use the three-argument
-     * overload and pass the configured removeForm.
+     * Retained for call sites that do not have access to a ComponentModel.
+     * New call sites should use the three-argument overload and pass the configured
+     * removeForm from CFG_GROUP_MEMBER_REMOVE_FORM.
      */
     public static String buildGroupMemberPatch(String op, String memberId) {
         return buildGroupMemberPatch(op, memberId, REMOVE_FORM_RFC_PATH_FILTER);
     }
 
     /**
-     * Builds a SCIM PATCH request body that replaces the entire members list of a group
-     * with the provided set of SCIM user IDs. Uses op=replace on the members attribute.
-     * RFC 7644 ss3.5.2.
+     * Build a SCIM PatchOp that replaces the entire members list of a group.
+     * Uses op=replace on the members attribute (RFC 7644 s3.5.2).
+     * An empty list produces a replace with an empty array, clearing all members.
      *
-     * An empty scimUserIds list produces a replace with an empty array (clears all members).
+     * The value array is variable-length so it is assembled with a StringBuilder.
+     * The surrounding envelope uses a text block with a %s slot.
      *
      * @param scimUserIds list of SCIM user IDs (the "value" field of each member entry)
      */
     public static String buildGroupMemberReplace(List<String> scimUserIds) {
-        StringBuilder valueArray = new StringBuilder("[");
-        if (scimUserIds != null && !scimUserIds.isEmpty()) {
+        StringBuilder arr = new StringBuilder("[");
+        if (scimUserIds != null) {
             for (int i = 0; i < scimUserIds.size(); i++) {
-                if (i > 0) valueArray.append(",");
-                valueArray.append("{\"value\":\"").append(esc(nvl(scimUserIds.get(i)))).append("\"}");
+                if (i > 0) arr.append(",");
+                arr.append("{\"value\":\"")
+                   .append(esc(nvl(scimUserIds.get(i))))
+                   .append("\"}");
             }
         }
-        valueArray.append("]");
+        arr.append("]");
 
-        return "{\n"
-             + "  \"schemas\": [\"urn:ietf:params:scim:api:messages:2.0:PatchOp\"],\n"
-             + "  \"Operations\": [\n"
-             + "    {\"op\":\"replace\",\"path\":\"members\",\"value\":" + valueArray + "}\n"
-             + "  ]\n"
-             + "}\n";
+        return """
+                {
+                  "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                  "Operations": [
+                    {"op":"replace","path":"members","value":%s}
+                  ]
+                }
+                """.formatted(arr);
     }
 
-    /** Build PatchOp to rename a SCIM group (replace displayName). */
+    /** Build a SCIM PatchOp that renames a group (replace displayName). */
     public static String buildPatchGroupDisplayName(String newDisplayName) {
         final String name = esc(nvl(newDisplayName));
         return """
-            {
-              "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
-              "Operations": [
-                {"op":"replace","path":"displayName","value":"%s"}
-              ]
-            }
-            """.formatted(name);
+                {
+                  "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                  "Operations": [
+                    {"op":"replace","path":"displayName","value":"%s"}
+                  ]
+                }
+                """.formatted(name);
     }
 
-    /* ===== helpers ===== */
+    // =========================================================================
+    // Helpers
+    // =========================================================================
 
-    /** JSON escape for string values. */
+    /** JSON-escape a string value. Handles all characters required by RFC 8259. */
     public static String esc(String s) {
         if (s == null) return "";
         StringBuilder out = new StringBuilder(s.length() + 16);
@@ -247,7 +279,7 @@ public final class ScimMapper {
         return out.toString();
     }
 
-    /** Null-to-empty helper. */
+    /** Converts null to empty string. */
     public static String nvl(String s) {
         return (s == null) ? "" : s;
     }
