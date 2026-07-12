@@ -79,21 +79,21 @@ class ScimGroupSyncResolutionSafetyTest {
         lenient().when(target.get(ScimTargetProviderFactory.CFG_SYNC_GROUPS_FILTER_REGEX)).thenReturn("false");
 
         when(session.groups()).thenReturn(groupProvider);
-        when(session.users()).thenReturn(userProvider);
+        lenient().when(session.users()).thenReturn(userProvider);
 
         when(group.getId()).thenReturn(GROUP_ID);
         when(group.getName()).thenReturn(GROUP_NAME);
-        when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
+        lenient().when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
                 .thenReturn(Stream.of(new GroupMembershipState(TARGET_ID, USER_A_ID, NEW_ADDED).toValue()));
-        when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
+        lenient().when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
                 .thenReturn(Stream.of(GroupMembershipState.pendingValue(TARGET_ID)));
 
-        when(userA.getId()).thenReturn(USER_A_ID);
-        when(userA.getUsername()).thenReturn("alice");
-        when(userB.getId()).thenReturn(USER_B_ID);
-        when(userB.getUsername()).thenReturn("bob");
+        lenient().when(userA.getId()).thenReturn(USER_A_ID);
+        lenient().when(userA.getUsername()).thenReturn("alice");
+        lenient().when(userB.getId()).thenReturn(USER_B_ID);
+        lenient().when(userB.getUsername()).thenReturn("bob");
 
-        when(groupProvider.searchForGroupByNameStream(eq(realm), eq(GROUP_NAME), eq(true), isNull(), isNull()))
+        lenient().when(groupProvider.searchForGroupByNameStream(eq(realm), eq(GROUP_NAME), eq(true), isNull(), isNull()))
                 .thenReturn(Stream.of(group));
     }
 
@@ -208,7 +208,7 @@ class ScimGroupSyncResolutionSafetyTest {
 
     @Test
     void crossCheck_groupNotFoundRemotely_noAutoCreate() {
-        when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
+        lenient().when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
                 .thenReturn(Stream.empty());
         when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
                 .thenReturn(Stream.empty());
