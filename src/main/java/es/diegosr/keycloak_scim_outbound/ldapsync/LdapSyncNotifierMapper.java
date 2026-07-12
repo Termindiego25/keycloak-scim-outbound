@@ -19,6 +19,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.stream.Collectors;
 
 /**
  * LDAP Storage Mapper that has NO knowledge of SCIM push logic. Its only job is to
@@ -26,6 +27,10 @@ import java.util.Optional;
  * is currently a member of that target's configured CFG_FILTER_GROUP, and flag a
  * pending state change ("NEW_ADDED" / "NEW_DELETED") whenever that membership differs
  * from what was last recorded.
+ *
+ * Also records group-level SCIM membership state (GroupMembershipState) for each in-scope
+ * group per target when CFG_SYNC_GROUPS is enabled, enabling the LDAP-driven /Groups
+ * provisioning path (ScimGroupSync).
  *
  * There are TWO entry points that can trigger this check, because Keycloak's LDAP
  * federation layer does not consistently notify per-user mappers of group membership
@@ -46,25 +51,13 @@ import java.util.Optional;
  * IMPORTANT (perf): this hook must NOT iterate every user in the realm on every
  * sync -- with hundreds/thousands of users that makes every LDAP sync (including
  * frequent delta syncs) extremely slow. Instead we build a small, targeted
- * candidate set (see buildCandidateUsers below) using indexed/scoped lookups:
- *   1. users CURRENTLY in one of the configured filter groups (via the built-in
- *      group-ldap-mapper's own group-scoped getGroupMembersStream(...) query --
- *      an LDAP search filtered to just that group, not a realm-wide user scan),
- *   2. users with an outstanding pending flag (indexed attribute search on
- *      MembershipState.PENDING_ATTRIBUTE_NAME),
- *   3. users we last recorded as an active/SENT member of a target (indexed
- *      attribute search on MembershipState.ATTRIBUTE_NAME for the exact JSON
- *      sentinel value) -- this is what lets us detect a user who just LEFT the
- *      group, since they will no longer appear in (1).
- * The union of these three sets is exactly the population that can possibly need a
- * membership-state transition; everyone else is provably unchanged since the last
- * sync and does not need to be touched.
+ * candidate set (see buildCandidateUsers below) using indexed/scoped lookups.
  *
  * IMPORTANT: this mapper must be ordered AFTER the built-in "group-ldap-mapper" in the
  * LDAP provider's Mappers list, so that user.getGroupsStream() already reflects the
  * group membership computed during this same sync pass. See README for setup.
  *
- * The actual SCIM push happens elsewhere (ScimMembershipSync), triggered by a timer or
+ * The actual SCIM push happens elsewhere (ScimMembershipSync / ScimGroupSync), triggered
  * by the SCIM target's own "Synchronize" action -- this class never calls out to SCIM.
  *
  * WRITE SAFETY: when the LDAP provider's edit mode is READ_ONLY (or the built-in
@@ -77,6 +70,9 @@ import java.util.Optional;
  * nothing to do with LDAP, so we must bypass that read-only delegate and write them
  * directly on Keycloak's LOCAL user storage instead, via
  * UserStoragePrivateUtil.userLocalStorage(session).
+ *
+ * Group attributes (GroupMembershipState.*) are written directly on GroupModel --
+ * groups are realm-local, not federated storage, so no UserStoragePrivateUtil is needed.
  */
 public class LdapSyncNotifierMapper implements LDAPStorageMapper {
 
@@ -174,7 +170,19 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
                 info("MARK NEW_DELETED user=%s target=%s group='%s' (id=%s) (was %s)",
                         user.getUsername(), target.getName(), groupName, groupId, old.state());
 
+            } else if (isMemberNow && existing.isPresent()
+                    && existing.get().state() == MembershipState.State.SENT) {
+                // No-op: user is in group and membership is already confirmed as SENT.
+                debug("No-op (already SENT) user=%s target=%s group='%s'",
+                        user.getUsername(), target.getName(), groupName);
+
+            } else if (!isMemberNow && existing.isEmpty()) {
+                // No-op: user is not in group and has never been tracked for this target.
+                debug("No-op (not member, no entry) user=%s target=%s group='%s'",
+                        user.getUsername(), target.getName(), groupName);
+
             } else {
+                // Catch-all: log whatever unexpected combination was encountered.
                 debug("No state transition needed for user=%s target=%s (isMemberNow=%s existing=%s)",
                         user.getUsername(), target.getName(), isMemberNow,
                         existing.map(MembershipState::state).orElse(null));
@@ -187,6 +195,142 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
         } else {
             debug("No attribute changes for user=%s.", user.getUsername());
         }
+
+        // Group-side write path: update GroupMembershipState for each in-scope group.
+        checkAndUpdateGroupMembership(realm, user, scimTargets);
+    }
+
+    /**
+     * Updates GroupMembershipState attributes on all in-scope groups for the given user.
+     * Called at the end of checkAndUpdateMembership so it runs for every user that the
+     * user-side check already processes. Group attributes are written directly on GroupModel
+     * (realm-local, not federated storage -- no UserStoragePrivateUtil needed).
+     */
+    private void checkAndUpdateGroupMembership(RealmModel realm, UserModel user,
+                                                List<ComponentModel> scimTargets) {
+        for (ComponentModel target : scimTargets) {
+            if (!"true".equalsIgnoreCase(ScimTargetProviderFactory.get(
+                    target, ScimTargetProviderFactory.CFG_SYNC_GROUPS, "false"))) {
+                continue;
+            }
+
+            // Determine in-scope groups for this target
+            List<GroupModel> inScopeGroups = resolveInScopeGroups(realm, target);
+            if (inScopeGroups.isEmpty()) continue;
+
+            // Groups the user is currently a member of, filtered to in-scope groups
+            List<String> currentGroupIds = user.getGroupsStream()
+                    .map(GroupModel::getId)
+                    .collect(Collectors.toList());
+
+            for (GroupModel group : inScopeGroups) {
+                boolean isInGroupNow = currentGroupIds.contains(group.getId());
+
+                List<String> stateValues = new ArrayList<>(
+                        group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME).toList());
+
+                Optional<GroupMembershipState> existing = GroupMembershipState.findForComponent(
+                        stateValues, target.getId(), user.getId());
+
+                boolean groupChanged = false;
+
+                if (isInGroupNow && existing.isEmpty()) {
+                    GroupMembershipState newEntry = new GroupMembershipState(
+                            target.getId(), user.getId(), GroupMembershipState.State.NEW_ADDED);
+                    stateValues.add(newEntry.toValue());
+                    groupChanged = true;
+                    info("GROUP MARK NEW_ADDED user=%s target=%s group='%s'",
+                            user.getUsername(), target.getName(), group.getName());
+
+                } else if (isInGroupNow && existing.isPresent()
+                        && existing.get().state() == GroupMembershipState.State.NEW_DELETED) {
+                    // Race guard: user left then rejoined before sweep ran.
+                    // Cancel NEW_DELETED, replace with NEW_ADDED.
+                    stateValues.remove(existing.get().toValue());
+                    GroupMembershipState newEntry = new GroupMembershipState(
+                            target.getId(), user.getId(), GroupMembershipState.State.NEW_ADDED);
+                    stateValues.add(newEntry.toValue());
+                    groupChanged = true;
+                    info("GROUP CANCEL NEW_DELETED -> MARK NEW_ADDED user=%s target=%s group='%s' (was %s)",
+                            user.getUsername(), target.getName(), group.getName(), existing.get().state());
+
+                } else if (!isInGroupNow && existing.isPresent()
+                        && existing.get().state() != GroupMembershipState.State.NEW_DELETED) {
+                    stateValues.remove(existing.get().toValue());
+                    GroupMembershipState newEntry = new GroupMembershipState(
+                            target.getId(), user.getId(), GroupMembershipState.State.NEW_DELETED);
+                    stateValues.add(newEntry.toValue());
+                    groupChanged = true;
+                    info("GROUP MARK NEW_DELETED user=%s target=%s group='%s' (was %s)",
+                            user.getUsername(), target.getName(), group.getName(), existing.get().state());
+
+                } else if (isInGroupNow && existing.isPresent()
+                        && existing.get().state() == GroupMembershipState.State.SENT) {
+                    // No-op: user is in group and membership is already confirmed as SENT.
+                    debug("GROUP no-op (already SENT) user=%s target=%s group='%s'",
+                            user.getUsername(), target.getName(), group.getName());
+
+                } else if (!isInGroupNow && existing.isPresent()
+                        && existing.get().state() == GroupMembershipState.State.NEW_DELETED) {
+                    // No-op: user is not in group and removal is already pending.
+                    debug("GROUP no-op (already NEW_DELETED) user=%s target=%s group='%s'",
+                            user.getUsername(), target.getName(), group.getName());
+
+                } else if (!isInGroupNow && existing.isEmpty()) {
+                    // No-op: user is not in group and was never tracked for this target.
+                    debug("GROUP no-op (not in group, no entry) user=%s target=%s group='%s'",
+                            user.getUsername(), target.getName(), group.getName());
+
+                } else {
+                    // Catch-all: log whatever unexpected combination was encountered.
+                    debug("GROUP unexpected state combination for user=%s target=%s group='%s' (isInGroupNow=%s existing=%s)",
+                            user.getUsername(), target.getName(), group.getName(), isInGroupNow,
+                            existing.map(GroupMembershipState::state).orElse(null));
+                }
+
+                if (groupChanged) {
+                    // Recompute pending flag for this target on this group
+                    boolean hasPending = stateValues.stream()
+                            .map(GroupMembershipState::parse)
+                            .filter(Optional::isPresent)
+                            .map(Optional::get)
+                            .anyMatch(e -> e.componentId().equals(target.getId())
+                                    && e.state() != GroupMembershipState.State.SENT);
+
+                    List<String> allPending = new ArrayList<>(
+                            group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME).toList());
+                    String pendingFlag = GroupMembershipState.pendingValue(target.getId());
+                    if (hasPending && !allPending.contains(pendingFlag)) {
+                        allPending.add(pendingFlag);
+                    } else if (!hasPending) {
+                        allPending.remove(pendingFlag);
+                    }
+
+                    group.setAttribute(GroupMembershipState.ATTRIBUTE_NAME, stateValues);
+                    group.setAttribute(GroupMembershipState.PENDING_ATTRIBUTE_NAME, allPending);
+                    debug("Persisted group state: group='%s' target=%s membershipState=%s pending=%s",
+                            group.getName(), target.getName(), stateValues, allPending);
+                }
+            }
+        }
+    }
+
+    /**
+     * Returns the list of in-scope groups for the given target.
+     * When CFG_SYNC_GROUPS_FILTER is blank: only the group named by CFG_FILTER_GROUP.
+     * When CFG_SYNC_GROUPS_FILTER is set: all realm groups whose name matches the regex.
+     */
+    private List<GroupModel> resolveInScopeGroups(RealmModel realm, ComponentModel target) {
+        String filter = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_SYNC_GROUPS_FILTER, null);
+        if (filter == null || filter.isBlank()) {
+            String filterGroupName = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
+            if (filterGroupName == null || filterGroupName.isBlank()) return List.of();
+            return session.groups().searchForGroupByNameStream(realm, filterGroupName, true, null, null)
+                    .collect(Collectors.toList());
+        }
+        return session.groups().getGroupsStream(realm)
+                .filter(g -> g.getName() != null && g.getName().matches(filter))
+                .collect(Collectors.toList());
     }
 
     /**
@@ -411,6 +555,10 @@ public class LdapSyncNotifierMapper implements LDAPStorageMapper {
 
     private static void info(String fmt, Object... args) {
         System.out.printf("%s %s INFO %s%n", now(), LOG_TAG, String.format(fmt, args));
+    }
+
+    private static void err(String fmt, Object... args) {
+        System.out.printf("%s %s ERROR %s%n", now(), LOG_TAG, String.format(fmt, args));
     }
 
     private static String now() {

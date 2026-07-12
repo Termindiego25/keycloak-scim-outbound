@@ -3,10 +3,13 @@ package es.diegosr.keycloak_scim_outbound.ldapsync;
 import es.diegosr.keycloak_scim_outbound.http.ScimClient;
 import es.diegosr.keycloak_scim_outbound.ui.ScimTargetProviderFactory;
 import es.diegosr.keycloak_scim_outbound.util.ScimMapper;
+import org.jboss.logging.Logger;
 import org.keycloak.component.ComponentModel;
+import org.keycloak.models.GroupModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
+import org.keycloak.models.UserProvider;
 import org.keycloak.storage.UserStoragePrivateUtil;
 
 import java.util.ArrayList;
@@ -14,53 +17,76 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.BiFunction;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
 /**
- * Consumes the state written by LdapSyncNotifierMapper (the
- * "ldapSyncNotifier.filterGroupMembership" attribute) and pushes pending
+ * Consumes the state written by LdapSyncNotifierMapper
+ * ("ldapSyncNotifier.filterGroupMembership" attribute) and pushes pending
  * membership changes to the relevant SCIM target(s).
  *
- * Invoked from two places:
- *   1. A 5-minute TimerProvider task (ScimEventListenerProviderFactory#postInit),
- *      scanning ALL SCIM targets in ALL realms.
- *   2. ScimTargetProviderFactory#sync / #syncSince (ImportSynchronization), triggered when
- *      an admin clicks "Synchronize all users" / "Synchronize changed users" on a
- *      specific SCIM outbound federation provider in the console -- scoped to just
- *      that one componentId.
+ * Two modes:
+ *   processPendingMembershipChanges -- delta flush; only users with pending entries
+ *   processFullUserSync             -- full re-provision all CFG_FILTER_GROUP members
  *
- * PERFORMANCE: this used to do a full user-stream scan per tick
- * (session.users().searchForUserStream(realm, Map.of())) to find users with a pending
- * entry in MembershipState.ATTRIBUTE_NAME -- an O(total realm users) operation on every
- * single sync cycle regardless of how many memberships actually changed (e.g. 941 users
- * scanned every run). It now uses the lightweight indexed attribute
- * MembershipState.PENDING_ATTRIBUTE_NAME (values "<componentId>:1", maintained by
- * LdapSyncNotifierMapper) and looks candidates up per-target via
- * searchForUserByUserAttributeStream(realm, PENDING_ATTRIBUTE_NAME, "<componentId>:1"),
- * which is an indexed local-storage lookup, not a full scan. Only users actually
- * flagged pending for a given target are loaded and processed.
+ * STATE INVARIANT (issues 2 and 4):
+ * MembershipState attributes are permanent lifecycle markers. They must never be
+ * bulk-cleared by a sync run. clearAllStateForTarget has been removed.
  *
- * NOTE: the lookup above is always run against UserStoragePrivateUtil.userLocalStorage(session),
- * never the aggregated session.users(). PENDING_ATTRIBUTE_NAME is a local bookkeeping
- * attribute with no meaning to any federated provider; searching it through the
- * aggregated view causes federated providers (e.g. the LDAP provider) to push the
- * attribute into their own native query, which fails for attributes they don't recognize.
+ * processFullUserSync transitions state after each operation:
+ *   - Successful upsert  -> entry becomes SENT (or is written as SENT if absent).
+ *   - Successful deprov  -> entry is removed entirely (user is gone; nothing to track).
+ *   - Failed operation   -> entry is left untouched for retry on the next cycle.
+ *
+ * The pending flag (ldapSyncNotifier.pending) is cleared only when no non-SENT entries
+ * remain for the target on that user.
+ *
+ * PERFORMANCE: processPendingMembershipChanges uses the lightweight indexed attribute
+ * MembershipState.PENDING_ATTRIBUTE_NAME and looks up candidates per-target via
+ * searchForUserByUserAttributeStream, which is an indexed local-storage lookup.
+ *
+ * NOTE: all user-attribute searches and writes go through localStorageFactory
+ * because PENDING_ATTRIBUTE_NAME / ATTRIBUTE_NAME are local bookkeeping attributes unknown to
+ * federated providers (e.g. LDAP). Searching them through the aggregated session.users() causes
+ * federated providers to push the attribute into their own native query, which fails.
  */
 public final class ScimMembershipSync {
 
-    private static final String LOG_TAG = "[keycloak-scim-outbound/LDAP-SYNC]";
-
-    private ScimMembershipSync() { }
+    private static final Logger LOG = Logger.getLogger(ScimMembershipSync.class);
 
     /**
-     * @param componentIdFilter if non-null, only process pending entries for this SCIM
-     *                          target's componentId (used by the manual "Synchronize" trigger).
-     *                          If null, process pending entries for every SCIM target in the realm
-     *                          (used by the periodic timer).
+     * Package-private factory for ScimClient instances.
+     * Default: ScimClient::new. Tests may replace this with a lambda returning a mock.
+     * Reset to ScimClient::new after each test to avoid cross-test pollution.
+     */
+    static BiFunction<String, String, ScimClient> clientFactory = ScimClient::new;
+
+    /**
+     * Package-private factory for the local UserProvider (bypasses federated storage).
+     * Default: UserStoragePrivateUtil::userLocalStorage. Tests may replace this with a
+     * lambda returning a mock UserProvider so the static call is never reached.
+     * Reset to the default after each test to avoid cross-test pollution.
+     */
+    static Function<KeycloakSession, UserProvider> localStorageFactory =
+            UserStoragePrivateUtil::userLocalStorage;
+
+    private ScimMembershipSync() {}
+
+    // =========================================================================
+    // Delta flush
+    // =========================================================================
+
+    /**
+     * Delta flush: process only pending entries for the given SCIM target.
+     *
+     * @param componentIdFilter if non-null, only process entries for this target's componentId.
+     *                          If null, process entries for every SCIM target in the realm.
      */
     public static void processPendingMembershipChanges(KeycloakSession session, RealmModel realm,
                                                        String componentIdFilter) {
         long start = System.currentTimeMillis();
-        debug("=== processPendingMembershipChanges START realm=%s componentIdFilter=%s ===",
+        LOG.infof("=== processPendingMembershipChanges START realm=%s componentIdFilter=%s ===",
                 realm.getName(), componentIdFilter == null ? "<all>" : componentIdFilter);
 
         List<ComponentModel> targets = realm.getComponentsStream()
@@ -69,87 +95,60 @@ public final class ScimMembershipSync {
                 .toList();
 
         if (targets.isEmpty()) {
-            debug("No matching SCIM outbound targets in realm=%s (filter=%s). Nothing to do.",
+            LOG.debugf("No matching SCIM targets in realm=%s (filter=%s). Nothing to do.",
                     realm.getName(), componentIdFilter);
             return;
         }
 
-        debug("Found %d SCIM target(s) to process in realm=%s: %s",
-                targets.size(), realm.getName(), targets.stream().map(ComponentModel::getName).toList());
-
-        int usersScanned = 0;
+        int usersScanned     = 0;
         int usersWithPending = 0;
-        int pushedAdds = 0;
-        int pushedRemoves = 0;
-        int failures = 0;
+        int pushedAdds       = 0;
+        int pushedRemoves    = 0;
+        int failures         = 0;
 
         for (ComponentModel target : targets) {
-            // Indexed lookup: only users flagged pending for THIS target, instead of
-            // scanning every user in the realm. Replaces the old
-            // session.users().searchForUserStream(realm, Map.of()) full scan.
-            //
-            // Queried against local storage only (not the aggregated session.users()),
-            // since PENDING_ATTRIBUTE_NAME is a local bookkeeping attribute, not an LDAP
-            // schema attribute. Searching it via the aggregated view causes the LDAP
-            // federation provider to push the attribute into a raw LDAP filter sent to
-            // AD, which AD rejects with InvalidSearchFilterException. See
-            // LdapSyncNotifierMapper for the same pattern.
             Map<String, UserModel> candidates = new LinkedHashMap<>();
-            UserStoragePrivateUtil.userLocalStorage(session)
+            localStorageFactory.apply(session)
                     .searchForUserByUserAttributeStream(realm,
                             MembershipState.PENDING_ATTRIBUTE_NAME,
                             MembershipState.pendingValue(target.getId()))
                     .forEach(u -> candidates.putIfAbsent(u.getId(), u));
 
-            debug("Target=%s (id=%s): %d candidate user(s) flagged pending via indexed lookup (no full realm scan).",
-                    target.getName(), target.getId(), candidates.size());
+            LOG.debugf("Target=%s: %d candidate user(s) pending.", target.getName(), candidates.size());
 
-            String base = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_BASE_URL, null);
+            String base  = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_BASE_URL, null);
             String token = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_TOKEN, null);
             if (base == null || token == null) {
-                err("Target=%s incomplete configuration (baseUrl/token). Skipping all pending entries for this target.",
-                        target.getName());
+                LOG.errorf("Target=%s incomplete configuration (baseUrl/token). Skipping.", target.getName());
                 failures += candidates.size();
                 continue;
             }
-
-            ScimClient client = new ScimClient(base, token);
+            ScimClient client = clientFactory.apply(base, token);
 
             for (UserModel user : candidates.values()) {
                 usersScanned++;
                 List<String> values = user.getAttributeStream(MembershipState.ATTRIBUTE_NAME).toList();
 
                 if (values.isEmpty()) {
-                    // Stale pending flag with no backing entry -- clear it defensively.
                     clearPendingFlag(session, realm, user, target.getId());
                     continue;
                 }
 
                 List<String> updatedValues = new ArrayList<>(values);
                 boolean userChanged = false;
-                boolean hadPendingForThisUser = false;
+                boolean hadPending  = false;
 
                 for (String rawValue : values) {
                     Optional<MembershipState> parsed = MembershipState.parse(rawValue);
-                    if (parsed.isEmpty()) {
-                        debug("Skipping unparsable attribute value '%s' for user=%s", rawValue, user.getUsername());
-                        continue;
-                    }
+                    if (parsed.isEmpty()) continue;
                     MembershipState entry = parsed.get();
-                    if (!entry.componentId().equals(target.getId())) {
-                        continue; // entry belongs to a different SCIM target
-                    }
-                    if (entry.state() == MembershipState.State.SENT) {
-                        continue; // already delivered, nothing to do
-                    }
+                    if (!entry.componentId().equals(target.getId())) continue;
+                    if (entry.state() == MembershipState.State.SENT) continue;
 
-                    hadPendingForThisUser = true;
-                    debug("Pending entry found: user=%s target=%s groupId=%s state=%s",
-                            user.getUsername(), target.getName(), entry.groupId(), entry.state());
-
+                    hadPending = true;
                     String scimUserName = computeScimUserName(target, user);
                     if (scimUserName == null || scimUserName.isBlank()) {
-                        err("Could not resolve SCIM userName for user=%s target=%s. Skipping.",
+                        LOG.errorf("Cannot resolve SCIM userName for user=%s target=%s. Skipping.",
                                 user.getUsername(), target.getName());
                         failures++;
                         continue;
@@ -157,19 +156,19 @@ public final class ScimMembershipSync {
 
                     try {
                         if (entry.state() == MembershipState.State.NEW_ADDED) {
-                            boolean ok = upsertUser(client, user, scimUserName);
+                            boolean ok = upsertUser(target, client, user, scimUserName);
                             if (ok) {
                                 updatedValues.remove(rawValue);
-                                MembershipState sent = new MembershipState(
-                                        entry.componentId(), entry.groupId(), MembershipState.State.SENT);
-                                updatedValues.add(sent.toValue());
+                                updatedValues.add(new MembershipState(
+                                        entry.componentId(), entry.groupId(),
+                                        MembershipState.State.SENT).toValue());
                                 userChanged = true;
                                 pushedAdds++;
-                                info("PUSHED ADD user=%s target=%s groupId=%s -> SENT",
+                                LOG.infof("PUSHED ADD user=%s target=%s groupId=%s -> SENT",
                                         user.getUsername(), target.getName(), entry.groupId());
                             } else {
                                 failures++;
-                                err("FAILED ADD push for user=%s target=%s groupId=%s. Will retry next run.",
+                                LOG.errorf("FAILED ADD user=%s target=%s groupId=%s. Will retry.",
                                         user.getUsername(), target.getName(), entry.groupId());
                             }
                         } else if (entry.state() == MembershipState.State.NEW_DELETED) {
@@ -178,160 +177,373 @@ public final class ScimMembershipSync {
                                 updatedValues.remove(rawValue);
                                 userChanged = true;
                                 pushedRemoves++;
-                                info("PUSHED REMOVE user=%s target=%s groupId=%s -> entry removed",
+                                LOG.infof("PUSHED REMOVE user=%s target=%s groupId=%s -> entry removed",
                                         user.getUsername(), target.getName(), entry.groupId());
                             } else {
                                 failures++;
-                                err("FAILED REMOVE push for user=%s target=%s groupId=%s. Will retry next run.",
+                                LOG.errorf("FAILED REMOVE user=%s target=%s groupId=%s. Will retry.",
                                         user.getUsername(), target.getName(), entry.groupId());
                             }
                         }
                     } catch (Exception e) {
                         failures++;
-                        err("EXCEPTION processing user=%s target=%s groupId=%s state=%s: %s",
-                                user.getUsername(), target.getName(), entry.groupId(), entry.state(), e.getMessage());
+                        LOG.errorf("EXCEPTION user=%s target=%s groupId=%s state=%s: %s",
+                                user.getUsername(), target.getName(), entry.groupId(), entry.state(),
+                                e.getMessage());
                     }
                 }
 
-                if (hadPendingForThisUser) usersWithPending++;
+                if (hadPending) usersWithPending++;
 
                 if (userChanged) {
-                    // Write through local storage: the user object here comes from
-                    // session.users() and may be a federated (e.g. read-only LDAP) view.
-                    // Writing directly to it throws ReadOnlyException when the LDAP
-                    // provider's edit mode is READ_ONLY. See LdapSyncNotifierMapper for
-                    // the same pattern.
-                    UserModel localUser = UserStoragePrivateUtil.userLocalStorage(session)
-                            .getUserById(realm, user.getId());
-                    if (localUser != null) {
-                        localUser.setAttribute(MembershipState.ATTRIBUTE_NAME, updatedValues);
-                        debug("Updated attribute for user=%s -> %s (via local storage)",
-                                user.getUsername(), updatedValues);
-                    } else {
-                        err("Could not resolve local storage user for id=%s (username=%s); attribute update skipped.",
-                                user.getId(), user.getUsername());
-                    }
+                    writeUserState(session, realm, user, updatedValues);
                 }
 
-                // Once this user has no more un-SENT entries for THIS target, clear its
-                // pending flag for this target so the next sync's indexed lookup skips it.
-                boolean stillPendingForTarget = updatedValues.stream()
+                boolean stillPending = updatedValues.stream()
                         .map(MembershipState::parse)
                         .filter(Optional::isPresent)
                         .map(Optional::get)
                         .anyMatch(s -> s.componentId().equals(target.getId())
                                 && s.state() != MembershipState.State.SENT);
-                if (!stillPendingForTarget) {
+                if (!stillPending) {
                     clearPendingFlag(session, realm, user, target.getId());
                 }
             }
         }
 
-        long durationMs = System.currentTimeMillis() - start;
-        info("=== processPendingMembershipChanges DONE realm=%s componentIdFilter=%s: "
-                        + "usersScanned=%d usersWithPending=%d pushedAdds=%d pushedRemoves=%d failures=%d durationMs=%d ===",
+        LOG.infof("=== processPendingMembershipChanges DONE realm=%s componentIdFilter=%s: "
+                        + "usersScanned=%d usersWithPending=%d pushedAdds=%d pushedRemoves=%d "
+                        + "failures=%d durationMs=%d ===",
                 realm.getName(), componentIdFilter == null ? "<all>" : componentIdFilter,
-                usersScanned, usersWithPending, pushedAdds, pushedRemoves, failures, durationMs);
+                usersScanned, usersWithPending, pushedAdds, pushedRemoves, failures,
+                System.currentTimeMillis() - start);
+    }
+
+    // =========================================================================
+    // Full sync
+    // =========================================================================
+
+    /**
+     * Full user sync: re-provision all current members of CFG_FILTER_GROUP and deprovision
+     * any users who were previously SENT but are no longer in scope.
+     *
+     * STATE INVARIANT: MembershipState attributes survive this call.
+     *   - Successful upsert  -> entry transitioned to SENT.
+     *   - Successful deprov  -> entry removed entirely.
+     *   - Failed operation   -> entry left untouched for retry.
+     * clearAllStateForTarget has been removed and is no longer called.
+     *
+     * @param componentIdFilter if non-null, scope to that target only.
+     */
+    public static void processFullUserSync(KeycloakSession session, RealmModel realm,
+                                           String componentIdFilter) {
+        long start = System.currentTimeMillis();
+        LOG.infof("=== processFullUserSync START realm=%s componentIdFilter=%s ===",
+                realm.getName(), componentIdFilter == null ? "<all>" : componentIdFilter);
+
+        List<ComponentModel> targets = realm.getComponentsStream()
+                .filter(c -> ScimTargetProviderFactory.ID.equals(c.getProviderId()))
+                .filter(c -> componentIdFilter == null || componentIdFilter.equals(c.getId()))
+                .toList();
+
+        if (targets.isEmpty()) {
+            LOG.debugf("No matching SCIM targets in realm=%s (filter=%s). Nothing to do.",
+                    realm.getName(), componentIdFilter);
+            return;
+        }
+
+        int usersUpserted      = 0;
+        int usersDeprovisioned = 0;
+        int failures           = 0;
+
+        for (ComponentModel target : targets) {
+            String base  = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_BASE_URL, null);
+            String token = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_TOKEN, null);
+            if (base == null || token == null) {
+                LOG.errorf("Target=%s incomplete config. Skipping full user sync.", target.getName());
+                continue;
+            }
+
+            String filterGroupName = ScimTargetProviderFactory.get(
+                    target, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
+            if (filterGroupName == null || filterGroupName.isBlank()) {
+                LOG.debugf("Target=%s has no CFG_FILTER_GROUP. Skipping full user sync.", target.getName());
+                continue;
+            }
+
+            Optional<GroupModel> filterGroupOpt = session.groups()
+                    .searchForGroupByNameStream(realm, filterGroupName, true, null, null)
+                    .findFirst();
+            if (filterGroupOpt.isEmpty()) {
+                LOG.errorf("Target=%s: filter group '%s' not found in realm=%s. Skipping.",
+                        target.getName(), filterGroupName, realm.getName());
+                continue;
+            }
+            GroupModel filterGroup = filterGroupOpt.get();
+
+            ScimClient client = clientFactory.apply(base, token);
+
+            Map<String, UserModel> currentMembers = new LinkedHashMap<>();
+            session.users().getGroupMembersStream(realm, filterGroup)
+                    .forEach(u -> currentMembers.put(u.getId(), u));
+
+            LOG.debugf("Target=%s: filter group '%s' has %d current member(s).",
+                    target.getName(), filterGroupName, currentMembers.size());
+
+            for (UserModel user : currentMembers.values()) {
+                String scimUserName = computeScimUserName(target, user);
+                if (scimUserName == null || scimUserName.isBlank()) {
+                    LOG.errorf("Cannot resolve SCIM userName for user=%s target=%s. Skipping.",
+                            user.getUsername(), target.getName());
+                    failures++;
+                    continue;
+                }
+                try {
+                    boolean ok = upsertUser(target, client, user, scimUserName);
+                    if (ok) {
+                        usersUpserted++;
+                        LOG.infof("FULL UPSERT user=%s target=%s -> OK", user.getUsername(), target.getName());
+                        transitionUserStateToSent(session, realm, user,
+                                target.getId(), filterGroup.getId());
+                    } else {
+                        failures++;
+                        LOG.errorf("FULL UPSERT FAILED user=%s target=%s.", user.getUsername(), target.getName());
+                    }
+                } catch (Exception e) {
+                    failures++;
+                    LOG.errorf("FULL UPSERT EXCEPTION user=%s target=%s: %s",
+                            user.getUsername(), target.getName(), e.getMessage());
+                }
+            }
+
+            String sentValue = new MembershipState(
+                    target.getId(), filterGroup.getId(), MembershipState.State.SENT).toValue();
+            List<UserModel> previouslyProvisioned = localStorageFactory.apply(session)
+                    .searchForUserByUserAttributeStream(realm, MembershipState.ATTRIBUTE_NAME, sentValue)
+                    .filter(u -> !currentMembers.containsKey(u.getId()))
+                    .collect(Collectors.toList());
+
+            LOG.debugf("Target=%s: %d previously-SENT user(s) no longer in filter group.",
+                    target.getName(), previouslyProvisioned.size());
+
+            for (UserModel user : previouslyProvisioned) {
+                String scimUserName = computeScimUserName(target, user);
+                try {
+                    boolean ok = deprovisionUser(target, client, user.getId(), scimUserName);
+                    if (ok) {
+                        usersDeprovisioned++;
+                        LOG.infof("FULL DEPROVISION user=%s target=%s -> OK",
+                                user.getUsername(), target.getName());
+                        removeUserStateEntry(session, realm, user,
+                                target.getId(), filterGroup.getId());
+                    } else {
+                        failures++;
+                        LOG.errorf("FULL DEPROVISION FAILED user=%s target=%s.",
+                                user.getUsername(), target.getName());
+                    }
+                } catch (Exception e) {
+                    failures++;
+                    LOG.errorf("FULL DEPROVISION EXCEPTION user=%s target=%s: %s",
+                            user.getUsername(), target.getName(), e.getMessage());
+                }
+            }
+        }
+
+        LOG.infof("=== processFullUserSync DONE realm=%s componentIdFilter=%s: "
+                        + "usersUpserted=%d usersDeprovisioned=%d failures=%d durationMs=%d ===",
+                realm.getName(), componentIdFilter == null ? "<all>" : componentIdFilter,
+                usersUpserted, usersDeprovisioned, failures,
+                System.currentTimeMillis() - start);
+    }
+
+    // =========================================================================
+    // State helpers
+    // =========================================================================
+
+    /**
+     * Transitions the MembershipState entry for (componentId, groupId) to SENT.
+     * If no entry exists for this pair, a new SENT entry is added.
+     * Entries for other targets or other groups are left untouched.
+     * The pending flag is cleared if no non-SENT entries remain for this target.
+     */
+    private static void transitionUserStateToSent(KeycloakSession session, RealmModel realm,
+                                                   UserModel user, String componentId, String groupId) {
+        List<String> current = new ArrayList<>(
+                user.getAttributeStream(MembershipState.ATTRIBUTE_NAME).toList());
+
+        boolean found = false;
+        List<String> updated = new ArrayList<>();
+        for (String raw : current) {
+            Optional<MembershipState> parsed = MembershipState.parse(raw);
+            if (parsed.isPresent()
+                    && parsed.get().componentId().equals(componentId)
+                    && parsed.get().groupId().equals(groupId)) {
+                updated.add(new MembershipState(componentId, groupId,
+                        MembershipState.State.SENT).toValue());
+                found = true;
+            } else {
+                updated.add(raw);
+            }
+        }
+        if (!found) {
+            updated.add(new MembershipState(componentId, groupId,
+                    MembershipState.State.SENT).toValue());
+        }
+
+        writeUserState(session, realm, user, updated);
+
+        boolean stillPending = updated.stream()
+                .map(MembershipState::parse)
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .anyMatch(s -> s.componentId().equals(componentId)
+                        && s.state() != MembershipState.State.SENT);
+        if (!stillPending) {
+            clearPendingFlag(session, realm, user, componentId);
+        }
     }
 
     /**
-     * Removes the "<componentId>:1" entry from MembershipState.PENDING_ATTRIBUTE_NAME
-     * for the given user, if present. Written through local storage for the same
-     * read-only-federation reason as the main tracking attribute.
+     * Removes the MembershipState entry for (componentId, groupId) entirely.
+     * Used after a successful deprovision: user is gone, nothing left to track.
+     * Entries for other targets or other groups are left untouched.
+     * The pending flag is cleared if no non-SENT entries remain for this target.
      */
-    private static void clearPendingFlag(KeycloakSession session, RealmModel realm,
-                                         UserModel user, String componentId) {
-        List<String> currentPending = user.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME).toList();
-        String pendingValue = MembershipState.pendingValue(componentId);
-        if (!currentPending.contains(pendingValue)) {
-            return; // nothing to clear
+    private static void removeUserStateEntry(KeycloakSession session, RealmModel realm,
+                                              UserModel user, String componentId, String groupId) {
+        List<String> current = new ArrayList<>(
+                user.getAttributeStream(MembershipState.ATTRIBUTE_NAME).toList());
+
+        List<String> updated = current.stream()
+                .filter(raw -> {
+                    Optional<MembershipState> parsed = MembershipState.parse(raw);
+                    if (parsed.isEmpty()) return true;
+                    return !(parsed.get().componentId().equals(componentId)
+                            && parsed.get().groupId().equals(groupId));
+                })
+                .collect(Collectors.toList());
+
+        writeUserState(session, realm, user, updated);
+
+        boolean stillPending = updated.stream()
+                .map(MembershipState::parse)
+                .filter(Optional::isPresent)
+                .map(Optional::get)
+                .anyMatch(s -> s.componentId().equals(componentId)
+                        && s.state() != MembershipState.State.SENT);
+        if (!stillPending) {
+            clearPendingFlag(session, realm, user, componentId);
         }
-        List<String> updatedPending = new ArrayList<>(currentPending);
-        updatedPending.remove(pendingValue);
-        UserModel localUser = UserStoragePrivateUtil.userLocalStorage(session).getUserById(realm, user.getId());
+    }
+
+    /**
+     * Writes the updated MembershipState attribute list through local storage.
+     * Must go through localStorageFactory because the user object from session.users()
+     * may be a federated (read-only LDAP) view and direct writes throw ReadOnlyException.
+     */
+    private static void writeUserState(KeycloakSession session, RealmModel realm,
+                                        UserModel user, List<String> updatedValues) {
+        UserModel localUser = localStorageFactory.apply(session)
+                .getUserById(realm, user.getId());
         if (localUser == null) {
-            err("Could not resolve local storage user for id=%s (username=%s); pending-flag clear skipped for componentId=%s.",
-                    user.getId(), user.getUsername(), componentId);
+            LOG.errorf("Cannot resolve local storage user for id=%s (username=%s); state write skipped.",
+                    user.getId(), user.getUsername());
             return;
         }
-        localUser.setAttribute(MembershipState.PENDING_ATTRIBUTE_NAME, updatedPending);
-        debug("Cleared pending flag for user=%s componentId=%s -> %s",
-                user.getUsername(), componentId, updatedPending);
+        localUser.setAttribute(MembershipState.ATTRIBUTE_NAME, updatedValues);
+        LOG.debugf("writeUserState user=%s -> %s", user.getUsername(), updatedValues);
     }
 
-    /* ===== SCIM push helpers (mirrors ScimEventListenerProvider logic) ===== */
+    /**
+     * Removes the pending flag for the given target from the user's PENDING_ATTRIBUTE_NAME.
+     * Written through local storage for the same reason as writeUserState.
+     */
+    private static void clearPendingFlag(KeycloakSession session, RealmModel realm,
+                                          UserModel user, String componentId) {
+        List<String> current = user.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME).toList();
+        String pendingValue = MembershipState.pendingValue(componentId);
+        if (!current.contains(pendingValue)) return;
 
-    private static String computeScimUserName(ComponentModel t, UserModel user) {
-        String strategy = ScimTargetProviderFactory.get(t, ScimTargetProviderFactory.CFG_UNAME_STRATEGY, "username");
-        switch (strategy) {
-            case "email":
-                return nullIfBlank(user.getEmail());
-            case "attribute":
-                String attr = ScimTargetProviderFactory.get(t, ScimTargetProviderFactory.CFG_UNAME_ATTR, null);
-                return attr == null ? null : nullIfBlank(user.getFirstAttribute(attr));
-            case "username":
-            default:
-                return user.getUsername();
+        List<String> updated = new ArrayList<>(current);
+        updated.remove(pendingValue);
+
+        UserModel localUser = localStorageFactory.apply(session)
+                .getUserById(realm, user.getId());
+        if (localUser == null) {
+            LOG.errorf("Cannot resolve local storage user for id=%s; pending-flag clear skipped for componentId=%s.",
+                    user.getId(), componentId);
+            return;
         }
+        localUser.setAttribute(MembershipState.PENDING_ATTRIBUTE_NAME, updated);
+        LOG.debugf("clearPendingFlag user=%s componentId=%s", user.getUsername(), componentId);
     }
 
-    private static String nullIfBlank(String s) {
-        return (s == null || s.isBlank()) ? null : s;
-    }
+    // =========================================================================
+    // SCIM push helpers
+    // =========================================================================
 
-    private static boolean upsertUser(ScimClient scim, UserModel user, String scimUserName) {
+    static boolean upsertUser(ComponentModel target, ScimClient scim,
+                               UserModel user, String scimUserName) {
         final String externalId = user.getId();
-        Optional<String> existingId = resolveScimId(scim, externalId, scimUserName);
+        Optional<String> existingId = resolveScimId(target, scim, externalId, scimUserName);
         if (existingId.isEmpty()) {
             boolean created = scim.createUser(ScimMapper.buildCreateUser(user, scimUserName));
             if (created) return true;
-            existingId = resolveScimId(scim, externalId, scimUserName);
-            return existingId.map(id -> scim.patchUser(id, ScimMapper.buildPatchUser(user, externalId))).orElse(false);
-        } else {
-            return scim.patchUser(existingId.get(), ScimMapper.buildPatchUser(user, externalId));
+            existingId = resolveScimId(target, scim, externalId, scimUserName);
+            return existingId.map(id -> scim.patchUser(id, ScimMapper.buildPatchUser(user, externalId)))
+                             .orElse(false);
         }
+        return scim.patchUser(existingId.get(), ScimMapper.buildPatchUser(user, externalId));
     }
 
-    private static boolean deprovisionUser(ComponentModel t, ScimClient scim,
-                                           String externalId, String scimUserName) {
-        Optional<String> id = resolveScimId(scim, externalId, scimUserName);
+    private static boolean deprovisionUser(ComponentModel target, ScimClient scim,
+                                            String externalId, String scimUserName) {
+        Optional<String> id = resolveScimId(target, scim, externalId, scimUserName);
         if (id.isEmpty()) {
-            debug("Deprovision NO-OP: user not found in SCIM target=%s (externalId=%s userName=%s)",
-                    t.getName(), externalId, scimUserName);
-            return true; // nothing to remove counts as a successful removal
+            LOG.debugf("Deprovision NO-OP: user not found (externalId=%s userName=%s)",
+                    externalId, scimUserName);
+            return true; // already absent -- counts as success
         }
-        String mode = ScimTargetProviderFactory.get(t, ScimTargetProviderFactory.CFG_DEPROVISION, "deactivate");
-        if ("delete".equals(mode)) {
-            return scim.deleteUser(id.get());
-        }
+        String mode = ScimTargetProviderFactory.get(
+                target, ScimTargetProviderFactory.CFG_DEPROVISION, "deactivate");
+        if ("delete".equals(mode)) return scim.deleteUser(id.get());
         return scim.patchUser(id.get(), ScimMapper.buildDeactivatePatch());
     }
 
-    private static Optional<String> resolveScimId(ScimClient scim, String externalId, String scimUserName) {
-        Optional<String> id = (externalId != null && !externalId.isBlank())
-                ? scim.findUserIdByExternalId(externalId)
-                : Optional.empty();
+    private static Optional<String> resolveScimId(ComponentModel target, ScimClient scim,
+                                                    String externalId, String scimUserName) {
+        String strategy = ScimTargetProviderFactory.get(target,
+                ScimTargetProviderFactory.CFG_LOOKUP_STRATEGY,
+                ScimTargetProviderFactory.LOOKUP_STRATEGY_EXTERNAL_ID_FIRST);
+
+        Optional<String> id = Optional.empty();
+
+        if (!ScimTargetProviderFactory.LOOKUP_STRATEGY_NAME_ONLY.equals(strategy)
+                && externalId != null && !externalId.isBlank()) {
+            id = scim.findUserIdByExternalId(externalId);
+        }
+
         if (id.isEmpty() && scimUserName != null && !scimUserName.isBlank()) {
             id = scim.findUserIdByUserName(scimUserName);
         }
+
         return id;
     }
 
-    /* ===== logging ===== */
-
-    private static String now() {
-        return java.time.OffsetDateTime.now().toString();
+    private static String computeScimUserName(ComponentModel t, UserModel user) {
+        String strategy = ScimTargetProviderFactory.get(
+                t, ScimTargetProviderFactory.CFG_UNAME_STRATEGY, "username");
+        return switch (strategy) {
+            case "email"     -> nvl(user.getEmail());
+            case "attribute" -> {
+                String attr = ScimTargetProviderFactory.get(t, ScimTargetProviderFactory.CFG_UNAME_ATTR, null);
+                yield attr == null ? null : nvl(user.getFirstAttribute(attr));
+            }
+            default          -> user.getUsername();
+        };
     }
 
-    private static void debug(String fmt, Object... args) {
-        System.out.printf("%s %s DEBUG %s%n", now(), LOG_TAG, String.format(fmt, args));
-    }
-
-    private static void info(String fmt, Object... args) {
-        System.out.printf("%s %s INFO %s%n", now(), LOG_TAG, String.format(fmt, args));
-    }
-
-    private static void err(String fmt, Object... args) {
-        System.err.printf("%s %s ERROR %s%n", now(), LOG_TAG, String.format(fmt, args));
+    private static String nvl(String s) {
+        return (s == null || s.isBlank()) ? null : s;
     }
 }
