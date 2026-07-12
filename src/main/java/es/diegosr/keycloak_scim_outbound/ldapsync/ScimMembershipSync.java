@@ -89,11 +89,11 @@ public final class ScimMembershipSync {
             return;
         }
 
-        int usersScanned    = 0;
+        int usersScanned     = 0;
         int usersWithPending = 0;
-        int pushedAdds      = 0;
-        int pushedRemoves   = 0;
-        int failures        = 0;
+        int pushedAdds       = 0;
+        int pushedRemoves    = 0;
+        int failures         = 0;
 
         for (ComponentModel target : targets) {
             Map<String, UserModel> candidates = new LinkedHashMap<>();
@@ -241,9 +241,9 @@ public final class ScimMembershipSync {
             return;
         }
 
-        int usersUpserted     = 0;
+        int usersUpserted      = 0;
         int usersDeprovisioned = 0;
-        int failures          = 0;
+        int failures           = 0;
 
         for (ComponentModel target : targets) {
             String base  = ScimTargetProviderFactory.get(target, ScimTargetProviderFactory.CFG_BASE_URL, null);
@@ -279,7 +279,6 @@ public final class ScimMembershipSync {
             LOG.debugf("Target=%s: filter group '%s' has %d current member(s).",
                     target.getName(), filterGroupName, currentMembers.size());
 
-            // Upsert every current member.
             for (UserModel user : currentMembers.values()) {
                 String scimUserName = computeScimUserName(target, user);
                 if (scimUserName == null || scimUserName.isBlank()) {
@@ -293,13 +292,11 @@ public final class ScimMembershipSync {
                     if (ok) {
                         usersUpserted++;
                         LOG.infof("FULL UPSERT user=%s target=%s -> OK", user.getUsername(), target.getName());
-                        // Transition state to SENT for this (target, filterGroup) pair.
                         transitionUserStateToSent(session, realm, user,
                                 target.getId(), filterGroup.getId());
                     } else {
                         failures++;
                         LOG.errorf("FULL UPSERT FAILED user=%s target=%s.", user.getUsername(), target.getName());
-                        // Entry left untouched for retry.
                     }
                 } catch (Exception e) {
                     failures++;
@@ -308,8 +305,6 @@ public final class ScimMembershipSync {
                 }
             }
 
-            // Find users previously SENT for this (target, filterGroup) but no longer members.
-            // Searched against local storage only (ATTRIBUTE_NAME is a local bookkeeping attr).
             String sentValue = new MembershipState(
                     target.getId(), filterGroup.getId(), MembershipState.State.SENT).toValue();
             List<UserModel> previouslyProvisioned = UserStoragePrivateUtil.userLocalStorage(session)
@@ -328,14 +323,12 @@ public final class ScimMembershipSync {
                         usersDeprovisioned++;
                         LOG.infof("FULL DEPROVISION user=%s target=%s -> OK",
                                 user.getUsername(), target.getName());
-                        // Remove the SENT entry entirely -- user is gone, nothing left to track.
                         removeUserStateEntry(session, realm, user,
                                 target.getId(), filterGroup.getId());
                     } else {
                         failures++;
                         LOG.errorf("FULL DEPROVISION FAILED user=%s target=%s.",
                                 user.getUsername(), target.getName());
-                        // Entry left as SENT for retry.
                     }
                 } catch (Exception e) {
                     failures++;
@@ -374,7 +367,6 @@ public final class ScimMembershipSync {
             if (parsed.isPresent()
                     && parsed.get().componentId().equals(componentId)
                     && parsed.get().groupId().equals(groupId)) {
-                // Replace with SENT regardless of prior state.
                 updated.add(new MembershipState(componentId, groupId,
                         MembershipState.State.SENT).toValue());
                 found = true;
