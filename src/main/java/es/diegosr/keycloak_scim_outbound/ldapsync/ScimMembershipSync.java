@@ -16,6 +16,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 
 /**
@@ -51,6 +52,13 @@ import java.util.stream.Collectors;
 public final class ScimMembershipSync {
 
     private static final Logger LOG = Logger.getLogger(ScimMembershipSync.class);
+
+    /**
+     * Package-private factory for ScimClient instances.
+     * Default: ScimClient::new. Tests may replace this with a lambda returning a mock.
+     * Reset to ScimClient::new after each test to avoid cross-test pollution.
+     */
+    static BiFunction<String, String, ScimClient> clientFactory = ScimClient::new;
 
     private ScimMembershipSync() {}
 
@@ -104,7 +112,7 @@ public final class ScimMembershipSync {
                 failures += candidates.size();
                 continue;
             }
-            ScimClient client = new ScimClient(base, token);
+            ScimClient client = clientFactory.apply(base, token);
 
             for (UserModel user : candidates.values()) {
                 usersScanned++;
@@ -262,7 +270,7 @@ public final class ScimMembershipSync {
             }
             GroupModel filterGroup = filterGroupOpt.get();
 
-            ScimClient client = new ScimClient(base, token);
+            ScimClient client = clientFactory.apply(base, token);
 
             Map<String, UserModel> currentMembers = new LinkedHashMap<>();
             session.users().getGroupMembersStream(realm, filterGroup)
