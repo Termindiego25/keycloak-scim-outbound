@@ -346,7 +346,7 @@ class ScimGroupSyncStateTest {
         when(groupProvider.getGroupsStream(realm)).thenReturn(Stream.of(group));
         when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
                 .thenAnswer(inv -> Stream.of(sentEntry));
-        when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
+        lenient().when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
                 .thenAnswer(inv -> Stream.of());
         when(group.getName()).thenReturn("old-group");
         when(client.deleteGroup(SCIM_GRP_ID)).thenReturn(false);
