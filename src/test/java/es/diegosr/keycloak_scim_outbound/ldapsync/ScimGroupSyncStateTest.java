@@ -56,8 +56,8 @@ class ScimGroupSyncStateTest {
     void setUp() {
         ScimGroupSync.clientFactory = (base, token) -> client;
 
-        // target component basics
-        when(realm.getComponentsStream()).thenReturn(Stream.of(target));
+        // target component basics -- thenAnswer so stream is fresh on every call
+        when(realm.getComponentsStream()).thenAnswer(inv -> Stream.of(target));
         when(target.getProviderId()).thenReturn(ScimTargetProviderFactory.ID);
         when(target.getId()).thenReturn(TARGET_ID);
         when(target.getName()).thenReturn("Test Target");
@@ -94,7 +94,7 @@ class ScimGroupSyncStateTest {
         lenient().when(session.groups()).thenReturn(groupProvider);
         lenient().when(session.users()).thenReturn(userProvider);
 
-        // group name lookup for resolveInScopeGroups
+        // group name lookup for resolveInScopeGroups -- fresh stream each call
         lenient().when(groupProvider.searchForGroupByNameStream(
                 eq(realm), eq(GROUP_NAME), eq(true), isNull(), isNull()))
                  .thenAnswer(inv -> Stream.of(group));
@@ -275,7 +275,7 @@ class ScimGroupSyncStateTest {
 
     @Test
     void fullSync_unresolvableMember_patchNotSent() {
-        when(userProvider.getGroupMembersStream(realm, group)).thenReturn(Stream.of(user));
+        when(userProvider.getGroupMembersStream(realm, group)).thenAnswer(inv -> Stream.of(user));
         // user cannot be resolved to a SCIM ID
         when(client.findUserIdByExternalId(USER_ID)).thenReturn(Optional.empty());
         when(client.findUserIdByUserName(any())).thenReturn(Optional.empty());
@@ -291,7 +291,7 @@ class ScimGroupSyncStateTest {
 
     @Test
     void fullSync_allMembersResolved_patchSent() {
-        when(userProvider.getGroupMembersStream(realm, group)).thenReturn(Stream.of(user));
+        when(userProvider.getGroupMembersStream(realm, group)).thenAnswer(inv -> Stream.of(user));
         when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
                 .thenAnswer(inv -> Stream.of());
         when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
@@ -311,7 +311,7 @@ class ScimGroupSyncStateTest {
     void deprovision_outOfScope_deleteSucceeds_stateClearedOnGroup() {
         String sentEntry = new GroupMembershipState(TARGET_ID, USER_ID, SENT).toValue();
         // group is "previously provisioned" (has state for this target)
-        when(groupProvider.getGroupsStream(realm)).thenReturn(Stream.of(group));
+        when(groupProvider.getGroupsStream(realm)).thenAnswer(inv -> Stream.of(group));
         when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
                 .thenAnswer(inv -> Stream.of(sentEntry));
         when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
@@ -343,10 +343,10 @@ class ScimGroupSyncStateTest {
     @Test
     void deprovision_outOfScope_deleteFails_stateRetained() {
         String sentEntry = new GroupMembershipState(TARGET_ID, USER_ID, SENT).toValue();
-        when(groupProvider.getGroupsStream(realm)).thenReturn(Stream.of(group));
+        when(groupProvider.getGroupsStream(realm)).thenAnswer(inv -> Stream.of(group));
         when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
                 .thenAnswer(inv -> Stream.of(sentEntry));
-        lenient().when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
+        when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
                 .thenAnswer(inv -> Stream.of());
         when(group.getName()).thenReturn("old-group");
         when(client.deleteGroup(SCIM_GRP_ID)).thenReturn(false);
@@ -365,7 +365,7 @@ class ScimGroupSyncStateTest {
     void fullSync_sentEntriesForOtherTarget_untouched() {
         String otherTargetEntry = new GroupMembershipState("target-2", USER_ID, SENT).toValue();
 
-        when(userProvider.getGroupMembersStream(realm, group)).thenReturn(Stream.of(user));
+        when(userProvider.getGroupMembersStream(realm, group)).thenAnswer(inv -> Stream.of(user));
         when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
                 .thenAnswer(inv -> Stream.of(otherTargetEntry));
         when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
