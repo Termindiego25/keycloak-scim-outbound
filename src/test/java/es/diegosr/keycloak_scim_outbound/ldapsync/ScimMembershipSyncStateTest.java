@@ -72,16 +72,16 @@ class ScimMembershipSyncStateTest {
         lenient().when(target.get(ScimTargetProviderFactory.CFG_DEPROVISION)).thenReturn("deactivate");
         lenient().when(target.get(ScimTargetProviderFactory.CFG_FILTER_GROUP)).thenReturn("filter-grp");
 
-        when(session.users()).thenReturn(userProvider);
-        when(session.groups()).thenReturn(groupProvider);
+        lenient().when(session.users()).thenReturn(userProvider);
+        lenient().when(session.groups()).thenReturn(groupProvider);
 
-        when(user.getId()).thenReturn(USER_ID);
-        when(user.getUsername()).thenReturn("alice");
-        when(localUser.getId()).thenReturn(USER_ID);
-        when(localUser.getUsername()).thenReturn("alice");
+        lenient().when(user.getId()).thenReturn(USER_ID);
+        lenient().when(user.getUsername()).thenReturn("alice");
+        lenient().when(localUser.getId()).thenReturn(USER_ID);
+        lenient().when(localUser.getUsername()).thenReturn("alice");
 
-        when(filterGroup.getId()).thenReturn(GROUP_ID);
-        when(filterGroup.getName()).thenReturn("filter-grp");
+        lenient().when(filterGroup.getId()).thenReturn(GROUP_ID);
+        lenient().when(filterGroup.getName()).thenReturn("filter-grp");
     }
 
     @AfterEach
