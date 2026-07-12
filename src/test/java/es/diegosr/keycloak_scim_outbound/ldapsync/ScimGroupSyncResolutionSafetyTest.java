@@ -185,7 +185,7 @@ class ScimGroupSyncResolutionSafetyTest {
     @Test
     void crossCheck_unresolvableLocalMember_noRemoveSent() {
         // Set up delta flush with no pending entries so only cross-check runs
-        when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
+        lenient().when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
                 .thenReturn(Stream.empty());
         when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
                 .thenReturn(Stream.empty());
