@@ -11,6 +11,7 @@ import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
 import org.keycloak.models.UserProvider;
+import org.keycloak.storage.DatastoreProvider;
 import org.keycloak.storage.datastore.DefaultDatastoreProvider;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
@@ -280,14 +281,15 @@ class LdapSyncNotifierMapperTest {
      * Stubs the local-storage chain that production code reaches via
      * UserStoragePrivateUtil.userLocalStorage(session).getUserById(realm, userId).
      *
-     * UserStoragePrivateUtil.userLocalStorage(session) is implemented as:
-     *   ((DefaultDatastoreProvider) session.getProvider(DefaultDatastoreProvider.class))
+     * In Keycloak 26.x, UserStoragePrivateUtil.userLocalStorage(session) is:
+     *   ((DefaultDatastoreProvider) session.getProvider(DatastoreProvider.class))
      *       .userLocalStorage()
      *
-     * We stub that chain here so no mockito-inline / static mocking is required.
+     * We stub session.getProvider(DatastoreProvider.class) -- note: DatastoreProvider.class
+     * is the lookup key, not DefaultDatastoreProvider.class. No static mocking needed.
      */
     private void mockLocalStorage(UserModel local) {
-        lenient().when(session.getProvider(DefaultDatastoreProvider.class))
+        lenient().when(session.getProvider(DatastoreProvider.class))
                 .thenReturn(datastoreProvider);
         lenient().when(datastoreProvider.userLocalStorage())
                 .thenReturn(localUserProvider);
