@@ -60,7 +60,7 @@ class ScimGroupSyncDeprovisionTest {
         when(realm.getComponentsStream()).thenReturn(Stream.of(target));
         when(target.getProviderId()).thenReturn(ScimTargetProviderFactory.ID);
         when(target.getId()).thenReturn(TARGET_ID);
-        when(target.getName()).thenReturn("Test Target");
+        lenient().when(target.getName()).thenReturn("Test Target");
         lenient().when(target.get(ScimTargetProviderFactory.CFG_BASE_URL)).thenReturn(BASE_URL);
         lenient().when(target.get(ScimTargetProviderFactory.CFG_TOKEN)).thenReturn(TOKEN);
         lenient().when(target.get(ScimTargetProviderFactory.CFG_SYNC_GROUPS)).thenReturn("true");
@@ -71,10 +71,10 @@ class ScimGroupSyncDeprovisionTest {
         lenient().when(target.get(ScimTargetProviderFactory.CFG_LOOKUP_STRATEGY))
                  .thenReturn(ScimTargetProviderFactory.LOOKUP_STRATEGY_EXTERNAL_ID_FIRST);
 
-        when(session.groups()).thenReturn(groupProvider);
+        lenient().when(session.groups()).thenReturn(groupProvider);
 
-        when(group.getId()).thenReturn(GROUP_ID);
-        when(group.getName()).thenReturn(GROUP_NAME); // out of scope
+        lenient().when(group.getId()).thenReturn(GROUP_ID);
+        lenient().when(group.getName()).thenReturn(GROUP_NAME); // out of scope
         // group has a state entry for target-1 -> previously provisioned.
         // Use thenAnswer so each call gets a fresh Stream (clearGroupState consumes
         // ATTRIBUTE_NAME and PENDING_ATTRIBUTE_NAME streams independently).
@@ -84,7 +84,7 @@ class ScimGroupSyncDeprovisionTest {
         lenient().when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
                 .thenAnswer(inv -> Stream.empty());
 
-        when(groupProvider.getGroupsStream(realm)).thenReturn(Stream.of(group));
+        lenient().when(groupProvider.getGroupsStream(realm)).thenReturn(Stream.of(group));
     }
 
     @AfterEach
