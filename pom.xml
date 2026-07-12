@@ -97,6 +97,10 @@
       <plugin>
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.3.1</version>
+        <configuration>
+          <!-- Byte Buddy experimental mode required for Java 23+ (Mockito 5.12 supports up to Java 22) -->
+          <argLine>-Dnet.bytebuddy.experimental=true</argLine>
+        </configuration>
       </plugin>
     </plugins>
   </build>
