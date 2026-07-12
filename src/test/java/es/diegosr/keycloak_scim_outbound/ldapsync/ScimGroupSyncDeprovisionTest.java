@@ -19,7 +19,6 @@ import java.util.List;
 import java.util.Optional;
 import java.util.stream.Stream;
 
-import static es.diegosr.keycloak_scim_outbound.ldapsync.GroupMembershipState.State.NEW_ADDED;
 import static es.diegosr.keycloak_scim_outbound.ldapsync.GroupMembershipState.State.SENT;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -76,12 +75,14 @@ class ScimGroupSyncDeprovisionTest {
 
         when(group.getId()).thenReturn(GROUP_ID);
         when(group.getName()).thenReturn(GROUP_NAME); // out of scope
-        // group has a state entry for target-1 -> previously provisioned
+        // group has a state entry for target-1 -> previously provisioned.
+        // Use thenAnswer so each call gets a fresh Stream (clearGroupState consumes
+        // ATTRIBUTE_NAME and PENDING_ATTRIBUTE_NAME streams independently).
         String stateEntry = new GroupMembershipState(TARGET_ID, USER_A_ID, SENT).toValue();
-        when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(stateEntry));
-        when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
-                .thenReturn(Stream.empty());
+        lenient().when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
+                .thenAnswer(inv -> Stream.of(stateEntry));
+        lenient().when(group.getAttributeStream(GroupMembershipState.PENDING_ATTRIBUTE_NAME))
+                .thenAnswer(inv -> Stream.empty());
 
         when(groupProvider.getGroupsStream(realm)).thenReturn(Stream.of(group));
     }
@@ -173,7 +174,7 @@ class ScimGroupSyncDeprovisionTest {
         // Override: group has state for a different target only
         String otherEntry = new GroupMembershipState("other-target", USER_A_ID, SENT).toValue();
         when(group.getAttributeStream(GroupMembershipState.ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(otherEntry));
+                .thenAnswer(inv -> Stream.of(otherEntry));
 
         ScimGroupSync.deprovisionOutOfScopeGroups(session, realm, TARGET_ID);
 
