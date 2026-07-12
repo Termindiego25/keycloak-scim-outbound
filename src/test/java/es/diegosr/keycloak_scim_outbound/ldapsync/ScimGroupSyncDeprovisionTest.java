@@ -98,7 +98,7 @@ class ScimGroupSyncDeprovisionTest {
     @Test
     void deleteSucceeds_groupStateCleared() {
         when(client.findGroupByExternalId(GROUP_ID))
-                .thenReturn(new ScimClient.ScimLookupResult(1, Optional.of(SCIM_GRP_ID)));
+                .thenReturn(new ScimClient.ScimLookupResult(Optional.of(SCIM_GRP_ID), 1));
         when(client.deleteGroup(SCIM_GRP_ID)).thenReturn(true);
 
         ScimGroupSync.deprovisionOutOfScopeGroups(session, realm, TARGET_ID);
@@ -124,7 +124,7 @@ class ScimGroupSyncDeprovisionTest {
     @Test
     void deleteFails_groupStateNotCleared() {
         when(client.findGroupByExternalId(GROUP_ID))
-                .thenReturn(new ScimClient.ScimLookupResult(1, Optional.of(SCIM_GRP_ID)));
+                .thenReturn(new ScimClient.ScimLookupResult(Optional.of(SCIM_GRP_ID), 1));
         when(client.deleteGroup(SCIM_GRP_ID)).thenReturn(false);
 
         ScimGroupSync.deprovisionOutOfScopeGroups(session, realm, TARGET_ID);
@@ -140,7 +140,7 @@ class ScimGroupSyncDeprovisionTest {
     @Test
     void groupNotFoundRemotely_kcAttributesClearedWithoutDelete() {
         when(client.findGroupByExternalId(GROUP_ID))
-                .thenReturn(new ScimClient.ScimLookupResult(0, Optional.empty()));
+                .thenReturn(new ScimClient.ScimLookupResult(Optional.empty(), 0));
         when(client.findGroupIdByDisplayName(GROUP_NAME)).thenReturn(Optional.empty());
 
         ScimGroupSync.deprovisionOutOfScopeGroups(session, realm, TARGET_ID);
