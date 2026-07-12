@@ -33,6 +33,11 @@ import static org.mockito.Mockito.*;
  *
  * Verifies delta flush and full sync state transitions, local-storage write
  * routing, and pending-flag lifecycle.
+ *
+ * UserStoragePrivateUtil.userLocalStorage is a static call that cannot be
+ * intercepted without mockito-inline. ScimMembershipSync exposes a
+ * package-private localStorageFactory seam (identical to clientFactory) that
+ * tests override to inject localUserProvider directly.
  */
 @ExtendWith(MockitoExtension.class)
 class ScimMembershipSyncStateTest {
@@ -57,10 +62,11 @@ class ScimMembershipSyncStateTest {
 
     @BeforeEach
     void setUp() {
-        ScimMembershipSync.clientFactory = (b, t) -> client;
+        ScimMembershipSync.clientFactory       = (b, t) -> client;
+        ScimMembershipSync.localStorageFactory = s -> localUserProvider;
 
         when(realm.getName()).thenReturn("test-realm");
-        when(realm.getComponentsStream()).thenReturn(Stream.of(target));
+        when(realm.getComponentsStream()).thenAnswer(inv -> Stream.of(target));
         when(target.getProviderId()).thenReturn(ScimTargetProviderFactory.ID);
         when(target.getId()).thenReturn(TARGET_ID);
         when(target.getName()).thenReturn("Test Target");
@@ -86,7 +92,8 @@ class ScimMembershipSyncStateTest {
 
     @AfterEach
     void tearDown() {
-        ScimMembershipSync.clientFactory = ScimClient::new;
+        ScimMembershipSync.clientFactory       = ScimClient::new;
+        ScimMembershipSync.localStorageFactory = org.keycloak.storage.UserStoragePrivateUtil::userLocalStorage;
     }
 
     // -------------------------------------------------------------------------
@@ -100,23 +107,18 @@ class ScimMembershipSyncStateTest {
 
         when(localUserProvider.searchForUserByUserAttributeStream(realm,
                 MembershipState.PENDING_ATTRIBUTE_NAME, pendingVal))
-                .thenReturn(Stream.of(user));
+                .thenAnswer(inv -> Stream.of(user));
         when(user.getAttributeStream(MembershipState.ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(addEntry));
+                .thenAnswer(inv -> Stream.of(addEntry));
         when(user.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(pendingVal));
+                .thenAnswer(inv -> Stream.of(pendingVal));
 
         // upsertUser path: user not found -> create succeeds
         when(client.findUserIdByExternalId(USER_ID)).thenReturn(Optional.empty());
         when(client.findUserIdByUserName("alice")).thenReturn(Optional.empty());
         when(client.createUser(any())).thenReturn(true);
 
-        // local storage write
         when(localUserProvider.getUserById(realm, USER_ID)).thenReturn(localUser);
-
-        // wire local storage
-        org.keycloak.storage.UserStoragePrivateUtil.class.getName(); // ensure class loaded
-        mockStatic_userLocalStorage(localUserProvider);
 
         ScimMembershipSync.processPendingMembershipChanges(session, realm, TARGET_ID);
 
@@ -139,17 +141,16 @@ class ScimMembershipSyncStateTest {
 
         when(localUserProvider.searchForUserByUserAttributeStream(realm,
                 MembershipState.PENDING_ATTRIBUTE_NAME, pendingVal))
-                .thenReturn(Stream.of(user));
+                .thenAnswer(inv -> Stream.of(user));
         when(user.getAttributeStream(MembershipState.ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(delEntry));
+                .thenAnswer(inv -> Stream.of(delEntry));
         when(user.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(pendingVal));
+                .thenAnswer(inv -> Stream.of(pendingVal));
 
         when(client.findUserIdByExternalId(USER_ID)).thenReturn(Optional.of(SCIM_UID));
         when(client.patchUser(eq(SCIM_UID), any())).thenReturn(true); // deactivate
 
         when(localUserProvider.getUserById(realm, USER_ID)).thenReturn(localUser);
-        mockStatic_userLocalStorage(localUserProvider);
 
         ScimMembershipSync.processPendingMembershipChanges(session, realm, TARGET_ID);
 
@@ -168,8 +169,8 @@ class ScimMembershipSyncStateTest {
     @Test
     void fullSync_upsertSucceeds_entryBecomeSent() {
         when(groupProvider.searchForGroupByNameStream(eq(realm), eq("filter-grp"), eq(true), isNull(), isNull()))
-                .thenReturn(Stream.of(filterGroup));
-        when(userProvider.getGroupMembersStream(realm, filterGroup)).thenReturn(Stream.of(user));
+                .thenAnswer(inv -> Stream.of(filterGroup));
+        when(userProvider.getGroupMembersStream(realm, filterGroup)).thenAnswer(inv -> Stream.of(user));
 
         when(client.findUserIdByExternalId(USER_ID)).thenReturn(Optional.of(SCIM_UID));
         when(client.patchUser(eq(SCIM_UID), any())).thenReturn(true);
@@ -178,13 +179,12 @@ class ScimMembershipSyncStateTest {
         String sentValue = new MembershipState(TARGET_ID, GROUP_ID, SENT).toValue();
         when(localUserProvider.searchForUserByUserAttributeStream(realm,
                 MembershipState.ATTRIBUTE_NAME, sentValue))
-                .thenReturn(Stream.empty());
+                .thenAnswer(inv -> Stream.empty());
 
-        when(user.getAttributeStream(MembershipState.ATTRIBUTE_NAME)).thenReturn(Stream.empty());
-        when(user.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME)).thenReturn(Stream.empty());
+        when(user.getAttributeStream(MembershipState.ATTRIBUTE_NAME)).thenAnswer(inv -> Stream.empty());
+        when(user.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME)).thenAnswer(inv -> Stream.empty());
         when(localUserProvider.getUserById(realm, USER_ID)).thenReturn(localUser);
-        when(localUser.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME)).thenReturn(Stream.empty());
-        mockStatic_userLocalStorage(localUserProvider);
+        when(localUser.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME)).thenAnswer(inv -> Stream.empty());
 
         ScimMembershipSync.processFullUserSync(session, realm, TARGET_ID);
 
@@ -203,25 +203,24 @@ class ScimMembershipSyncStateTest {
     @Test
     void fullSync_deprovisionSucceeds_entryRemovedEntirely() {
         when(groupProvider.searchForGroupByNameStream(eq(realm), eq("filter-grp"), eq(true), isNull(), isNull()))
-                .thenReturn(Stream.of(filterGroup));
+                .thenAnswer(inv -> Stream.of(filterGroup));
         // No current members
-        when(userProvider.getGroupMembersStream(realm, filterGroup)).thenReturn(Stream.empty());
+        when(userProvider.getGroupMembersStream(realm, filterGroup)).thenAnswer(inv -> Stream.empty());
 
         // Previously SENT user no longer in group
         String sentValue = new MembershipState(TARGET_ID, GROUP_ID, SENT).toValue();
         when(localUserProvider.searchForUserByUserAttributeStream(realm,
                 MembershipState.ATTRIBUTE_NAME, sentValue))
-                .thenReturn(Stream.of(user));
+                .thenAnswer(inv -> Stream.of(user));
 
         when(client.findUserIdByExternalId(USER_ID)).thenReturn(Optional.of(SCIM_UID));
         when(client.patchUser(eq(SCIM_UID), any())).thenReturn(true); // deactivate
 
         when(user.getAttributeStream(MembershipState.ATTRIBUTE_NAME))
-                .thenReturn(Stream.of(sentValue));
-        when(user.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME)).thenReturn(Stream.empty());
+                .thenAnswer(inv -> Stream.of(sentValue));
+        when(user.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME)).thenAnswer(inv -> Stream.empty());
         when(localUserProvider.getUserById(realm, USER_ID)).thenReturn(localUser);
-        when(localUser.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME)).thenReturn(Stream.empty());
-        mockStatic_userLocalStorage(localUserProvider);
+        when(localUser.getAttributeStream(MembershipState.PENDING_ATTRIBUTE_NAME)).thenAnswer(inv -> Stream.empty());
 
         ScimMembershipSync.processFullUserSync(session, realm, TARGET_ID);
 
@@ -240,31 +239,10 @@ class ScimMembershipSyncStateTest {
     @Test
     void fullSync_noFilterGroup_skipped() {
         when(target.get(ScimTargetProviderFactory.CFG_FILTER_GROUP)).thenReturn(null);
-        mockStatic_userLocalStorage(localUserProvider);
 
         ScimMembershipSync.processFullUserSync(session, realm, TARGET_ID);
 
         verify(client, never()).createUser(any());
         verify(client, never()).patchUser(any(), any());
-    }
-
-    // -------------------------------------------------------------------------
-    // Helper: mock UserStoragePrivateUtil.userLocalStorage via clientFactory side-effect
-    // We cannot mock the static method directly without mockito-inline, so we use a
-    // package-private test seam: inject localUserProvider via the session mock chain.
-    // -------------------------------------------------------------------------
-
-    /**
-     * Routes session -> UserStoragePrivateUtil.userLocalStorage calls to localUserProvider.
-     * UserStoragePrivateUtil.userLocalStorage(session) is called internally; we mock the
-     * session to return localUserProvider for all user-attribute lookups that go through it.
-     *
-     * In practice the static call cannot be intercepted without mockito-inline / PowerMock.
-     * These tests therefore validate the state-transition logic by verifying calls on
-     * localUser (returned by localUserProvider.getUserById), which is the write target.
-     */
-    private void mockStatic_userLocalStorage(UserProvider local) {
-        // No-op placeholder: actual routing is handled by the when() stubs on localUserProvider
-        // and localUser set up per test. This method documents the intent clearly.
     }
 }
