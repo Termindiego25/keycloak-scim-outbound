@@ -107,8 +107,8 @@ class ScimMapperTest {
         String json = ScimMapper.buildCreateGroup("Engineering", "kc-group-uuid-1");
 
         assertTrue(json.contains("urn:ietf:params:scim:schemas:core:2.0:Group"));
-        assertTrue(json.contains("\"externalId\":\"kc-group-uuid-1\""));
-        assertTrue(json.contains("\"displayName\":\"Engineering\""));
+        assertTrue(json.contains("\"externalId\": \"kc-group-uuid-1\""));
+        assertTrue(json.contains("\"displayName\": \"Engineering\""));
     }
 
     // -------------------------------------------------------------------------
