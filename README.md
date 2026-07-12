@@ -17,10 +17,6 @@ A lightweight **Keycloak extension** that provisions users and groups to externa
 - 🔒 **Token-based authentication (Bearer)** — no password sync required.
 - 📂 **LDAP/AD support** — Optional [LDAP/AD support](#-optional-ldap--active-directory-integration) via a built-in `LdapSyncNotifierMapper`.
 - 🗂️ **Optional SCIM Group sync** — Push Keycloak group create/rename/delete and membership changes to SCIM `/Groups`. Opt-in, disabled by default. Supports both event-driven changes and **LDAP-driven** membership changes.
-- 🏗️ **LDAP group auto-provisioning** — Automatically create missing in-scope SCIM groups during LDAP delta or full synchronization.
-- 🧹 **Out-of-scope group cleanup** — Delete remote SCIM groups when the corresponding Keycloak group is deleted or no longer matches the configured group scope.
-- 🔎 **Configurable SCIM ID lookup** — Resolve users and groups by `externalId` first or use names only for SCIM servers that do not handle `externalId` filters correctly.
-- 🪵 **Debug logging** — Optional request/response, lookup, diff-decision, and sync call-site logging.
 
 ---
 
@@ -78,7 +74,8 @@ Once deployed:
 | **Deprovision Action** | What to do on delete or group removal: `deactivate` (PATCH `active=false`, default) or `delete` (`DELETE /Users/{id}`) | ✅ |
 | **Lookup Strategy** | How to resolve SCIM user and group IDs: `externalId first` (default) or `name only` | ✅ |
 | **Sync Groups** | Enable SCIM `/Groups` sync. Group create/rename/delete and membership changes are pushed to the SCIM target. Disabled by default. | ❌ |
-| **Sync Groups Filter (regex)** | Java regex pattern for group names to include, e.g. `admins\|developers\|team-.*`. Leave blank to scope group sync to *Filter Group* only. | ❌ |
+| **Sync Groups Filter** | Comma-delimited list for group names to include, e.g. `admins,developers,team-engineering`. Leave blank to scope group sync to *Filter Group* only. | ❌ |
+| **Use Regex for Group Filter** | Enable to use Java regex patterns for group filter, e.g. `admins\|developers\|team-.*`. | ❌ |
 | **LDAP Users Provisioning Mode** | How LDAP-driven user sync runs on *Synchronize changed users*: `Delta` (default) or `Full` | ✅ |
 | **LDAP Groups Provisioning Mode** | How LDAP-driven group sync runs on *Synchronize changed users*: `Delta (add members)` (default), `Delta (add and remove members)`, or `Full` | ✅ |
 | **Group Member Remove Form** | SCIM PATCH format for removing a group member: `RFC 7644 path filter` (default) or `Non-RFC value array` | ✅ |
@@ -241,6 +238,7 @@ At `DEBUG` level, the plugin can log:
 - Group cross-check decisions and removals
 - Group auto-provisioning decisions and payloads
 - Out-of-scope group deprovision decisions
+- Requests and responses
 
 ---
 
