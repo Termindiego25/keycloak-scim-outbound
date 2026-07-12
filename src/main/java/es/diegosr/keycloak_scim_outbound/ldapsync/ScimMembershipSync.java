@@ -9,6 +9,7 @@ import org.keycloak.models.GroupModel;
 import org.keycloak.models.KeycloakSession;
 import org.keycloak.models.RealmModel;
 import org.keycloak.models.UserModel;
+import org.keycloak.models.UserProvider;
 import org.keycloak.storage.UserStoragePrivateUtil;
 
 import java.util.ArrayList;
@@ -17,6 +18,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.BiFunction;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 /**
@@ -44,7 +46,7 @@ import java.util.stream.Collectors;
  * MembershipState.PENDING_ATTRIBUTE_NAME and looks up candidates per-target via
  * searchForUserByUserAttributeStream, which is an indexed local-storage lookup.
  *
- * NOTE: all user-attribute searches and writes go through UserStoragePrivateUtil.userLocalStorage
+ * NOTE: all user-attribute searches and writes go through localStorageFactory
  * because PENDING_ATTRIBUTE_NAME / ATTRIBUTE_NAME are local bookkeeping attributes unknown to
  * federated providers (e.g. LDAP). Searching them through the aggregated session.users() causes
  * federated providers to push the attribute into their own native query, which fails.
@@ -59,6 +61,15 @@ public final class ScimMembershipSync {
      * Reset to ScimClient::new after each test to avoid cross-test pollution.
      */
     static BiFunction<String, String, ScimClient> clientFactory = ScimClient::new;
+
+    /**
+     * Package-private factory for the local UserProvider (bypasses federated storage).
+     * Default: UserStoragePrivateUtil::userLocalStorage. Tests may replace this with a
+     * lambda returning a mock UserProvider so the static call is never reached.
+     * Reset to the default after each test to avoid cross-test pollution.
+     */
+    static Function<KeycloakSession, UserProvider> localStorageFactory =
+            UserStoragePrivateUtil::userLocalStorage;
 
     private ScimMembershipSync() {}
 
@@ -97,7 +108,7 @@ public final class ScimMembershipSync {
 
         for (ComponentModel target : targets) {
             Map<String, UserModel> candidates = new LinkedHashMap<>();
-            UserStoragePrivateUtil.userLocalStorage(session)
+            localStorageFactory.apply(session)
                     .searchForUserByUserAttributeStream(realm,
                             MembershipState.PENDING_ATTRIBUTE_NAME,
                             MembershipState.pendingValue(target.getId()))
@@ -307,7 +318,7 @@ public final class ScimMembershipSync {
 
             String sentValue = new MembershipState(
                     target.getId(), filterGroup.getId(), MembershipState.State.SENT).toValue();
-            List<UserModel> previouslyProvisioned = UserStoragePrivateUtil.userLocalStorage(session)
+            List<UserModel> previouslyProvisioned = localStorageFactory.apply(session)
                     .searchForUserByUserAttributeStream(realm, MembershipState.ATTRIBUTE_NAME, sentValue)
                     .filter(u -> !currentMembers.containsKey(u.getId()))
                     .collect(Collectors.toList());
@@ -427,12 +438,12 @@ public final class ScimMembershipSync {
 
     /**
      * Writes the updated MembershipState attribute list through local storage.
-     * Must go through UserStoragePrivateUtil because the user object from session.users()
+     * Must go through localStorageFactory because the user object from session.users()
      * may be a federated (read-only LDAP) view and direct writes throw ReadOnlyException.
      */
     private static void writeUserState(KeycloakSession session, RealmModel realm,
                                         UserModel user, List<String> updatedValues) {
-        UserModel localUser = UserStoragePrivateUtil.userLocalStorage(session)
+        UserModel localUser = localStorageFactory.apply(session)
                 .getUserById(realm, user.getId());
         if (localUser == null) {
             LOG.errorf("Cannot resolve local storage user for id=%s (username=%s); state write skipped.",
@@ -456,7 +467,7 @@ public final class ScimMembershipSync {
         List<String> updated = new ArrayList<>(current);
         updated.remove(pendingValue);
 
-        UserModel localUser = UserStoragePrivateUtil.userLocalStorage(session)
+        UserModel localUser = localStorageFactory.apply(session)
                 .getUserById(realm, user.getId());
         if (localUser == null) {
             LOG.errorf("Cannot resolve local storage user for id=%s; pending-flag clear skipped for componentId=%s.",
