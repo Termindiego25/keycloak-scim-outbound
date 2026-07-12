@@ -68,11 +68,11 @@ class LdapSyncNotifierMapperTest {
         when(session.groups()).thenReturn(groupProvider);
 
         when(filterGroup.getId()).thenReturn(GROUP_ID);
-        when(filterGroup.getName()).thenReturn(GROUP_NAME);
+        lenient().when(filterGroup.getName()).thenReturn(GROUP_NAME);
         when(groupProvider.searchForGroupByNameStream(eq(realm), eq(GROUP_NAME), eq(true), isNull(), isNull()))
                 .thenReturn(Stream.of(filterGroup));
 
-        when(user.getId()).thenReturn(USER_ID);
+        lenient().when(user.getId()).thenReturn(USER_ID);
         when(user.getUsername()).thenReturn("alice");
 
         mapper = new LdapSyncNotifierMapper(session, target);
