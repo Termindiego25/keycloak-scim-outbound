@@ -15,6 +15,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 
 /**
@@ -54,6 +55,13 @@ public final class ScimGroupSync {
     public static final String MODE_DELTA_ONLY        = "Delta (add members)";
     public static final String MODE_DELTA_DEPROVISION = "Delta (add and remove members)";
     public static final String MODE_FULL              = "Full";
+
+    /**
+     * Package-private factory for ScimClient instances.
+     * Default: ScimClient::new. Tests may replace this with a lambda returning a mock.
+     * Reset to ScimClient::new after each test to avoid cross-test pollution.
+     */
+    static BiFunction<String, String, ScimClient> clientFactory = ScimClient::new;
 
     private ScimGroupSync() {}
 
@@ -106,7 +114,7 @@ public final class ScimGroupSync {
                 LOG.errorf("Target=%s incomplete config (baseUrl/token). Skipping group sync.", target.getName());
                 continue;
             }
-            ScimClient client = new ScimClient(base, token);
+            ScimClient client = clientFactory.apply(base, token);
             String removeForm = ScimTargetProviderFactory.get(target,
                     ScimTargetProviderFactory.CFG_GROUP_MEMBER_REMOVE_FORM,
                     ScimMapper.REMOVE_FORM_RFC_PATH_FILTER);
@@ -264,7 +272,7 @@ public final class ScimGroupSync {
                 LOG.errorf("Target=%s incomplete config (baseUrl/token). Skipping full group sync.", target.getName());
                 continue;
             }
-            ScimClient client = new ScimClient(base, token);
+            ScimClient client = clientFactory.apply(base, token);
 
             List<GroupModel> inScopeGroups = resolveInScopeGroups(session, realm, target);
             LOG.debugf("Target=%s: %d in-scope group(s) for full sync.", target.getName(), inScopeGroups.size());
@@ -586,7 +594,7 @@ public final class ScimGroupSync {
                 LOG.errorf("Target=%s: incomplete config. Skipping deprovision sweep.", target.getName());
                 continue;
             }
-            ScimClient client = new ScimClient(base, token);
+            ScimClient client = clientFactory.apply(base, token);
 
             // Full group-stream scan is acceptable: group counts are small (tens to low hundreds)
             // and Keycloak has no indexed group-attribute search API.
