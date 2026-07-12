@@ -211,6 +211,7 @@ The `Delta (add and remove members)` mode performs an additional cross-check aft
 
 ## 🪵 Logging
 
+All logs use Keycloak's JBoss Logging infrastructure. They are emitted under the plugin category and respect Keycloak's configured level and appenders.
 All plugin logs are prefixed with:
 
 ```text
@@ -239,6 +240,20 @@ At `DEBUG` level, the plugin can log:
 - Group auto-provisioning decisions and payloads
 - Out-of-scope group deprovision decisions
 - Requests and responses
+
+> **Security note:** request and response bodies can contain personally identifiable data and, depending on the SCIM operation, sensitive values. Enable debug logging only for troubleshooting, protect access to the logs, and return the log level to normal after the investigation.
+
+---
+
+## Testing
+
+The project includes JUnit 5 and Mockito-based tests. Run the test suite with:
+
+```bash
+mvn test
+```
+
+The test coverage and manual verification plan are documented in [TESTING.md](TESTING.md). It includes payload validation, user and group state transitions, filter configuration, lookup safety, remote deprovisioning, notifier behavior, and recommended integration checks.
 
 ---
 
@@ -273,19 +288,23 @@ kc.sh start-dev --spi-events-listener-keycloak-scim-outbound-enabled=true
 ```text
 keycloak-scim-outbound/
 ├── pom.xml
-└── src/main/java/es/diegosr/keycloak_scim_outbound/
-    ├── ScimEventListenerProvider.java
-    ├── ScimEventListenerProviderFactory.java
-    ├── http/ScimClient.java
-    ├── ldapsync/GroupMembershipState.java
-    ├── ldapsync/LdapSyncNotifierMapper.java
-    ├── ldapsync/LdapSyncNotifierMapperFactory.java
-    ├── ldapsync/MembershipState.java
-    ├── ldapsync/ScimGroupSync.java
-    ├── ldapsync/ScimMembershipSync.java
-    ├── ui/ScimTargetProviderFactory.java
-    ├── ui/ScimTargetProvider.java
-    └── util/ScimMapper.java
+├── README.md
+├── TESTING.md
+└── src/
+    ├── main/java/es/diegosr/keycloak_scim_outbound/
+    │   ├── ScimEventListenerProvider.java
+    │   ├── ScimEventListenerProviderFactory.java
+    │   ├── http/ScimClient.java
+    │   ├── ldapsync/GroupMembershipState.java
+    │   ├── ldapsync/LdapSyncNotifierMapper.java
+    │   ├── ldapsync/LdapSyncNotifierMapperFactory.java
+    │   ├── ldapsync/MembershipState.java
+    │   ├── ldapsync/ScimGroupSync.java
+    │   ├── ldapsync/ScimMembershipSync.java
+    │   ├── ui/ScimTargetProvider.java
+    │   ├── ui/ScimTargetProviderFactory.java
+    │   └── util/ScimMapper.java
+    └── test/java/
 ```
 
 ---
