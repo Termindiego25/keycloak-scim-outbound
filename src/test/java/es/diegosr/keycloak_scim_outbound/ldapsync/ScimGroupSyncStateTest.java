@@ -101,7 +101,7 @@ class ScimGroupSyncStateTest {
 
         // SCIM group lookup
         lenient().when(client.findGroupByExternalId(GROUP_ID))
-                 .thenReturn(new ScimClient.ScimLookupResult(1, Optional.of(SCIM_GRP_ID)));
+                 .thenReturn(new ScimClient.ScimLookupResult(Optional.of(SCIM_GRP_ID), 1));
         lenient().when(client.findGroupIdByDisplayName(GROUP_NAME))
                  .thenReturn(Optional.of(SCIM_GRP_ID));
 
