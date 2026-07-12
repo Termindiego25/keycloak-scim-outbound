@@ -17,12 +17,14 @@ import org.keycloak.events.admin.ResourceType;
 import org.keycloak.models.*;
 
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 
 /**
  * Event listener that pushes user lifecycle changes (create/update/delete)
@@ -458,29 +460,50 @@ public class ScimEventListenerProvider implements EventListenerProvider {
     /**
      * Returns true if the group should be synced for this target.
      *
-     * When CFG_SYNC_GROUPS_FILTER is blank: only the group named by CFG_FILTER_GROUP is in scope.
-     * When CFG_SYNC_GROUPS_FILTER is set: the group name must match the Java regex.
-     * groupName=null: returns true only when filter is set (so that DELETE events where the
-     * group is already gone can still be attempted by regex-configured targets), and false
-     * for the blank-filter case (no name to match against CFG_FILTER_GROUP).
+     * Mode is controlled by CFG_SYNC_GROUPS_FILTER_REGEX (default false):
+     *
+     * false (comma-delimited, default):
+     *   CFG_SYNC_GROUPS_FILTER is split on commas, each part trimmed.
+     *   groupName must be an exact member of that set.
+     *   Empty filter falls back to CFG_FILTER_GROUP (single exact match).
+     *   groupName=null always returns false in this mode.
+     *
+     * true (regex):
+     *   CFG_SYNC_GROUPS_FILTER is a Java regex applied via groupName.matches().
+     *   Empty filter falls back to CFG_FILTER_GROUP exact match.
+     *   groupName=null returns true so DELETE events where the KC group is already
+     *   gone are not silently dropped by regex-configured targets.
      */
     private boolean isGroupAllowedForSync(ComponentModel t, String groupName) {
-        String filter = get(t, CFG_SYNC_GROUPS_FILTER, null);
+        final String  filter   = get(t, CFG_SYNC_GROUPS_FILTER, null);
+        final boolean useRegex = "true".equalsIgnoreCase(get(t, CFG_SYNC_GROUPS_FILTER_REGEX, "false"));
+
         if (filter == null || filter.isBlank()) {
-            // No regex: only the CFG_FILTER_GROUP is in scope
+            // No filter configured: fall back to CFG_FILTER_GROUP exact match
             if (groupName == null) return false;
             String filterGroup = get(t, CFG_FILTER_GROUP, null);
             return groupName.equals(filterGroup);
         }
-        // Regex filter: null groupName passes so DELETE events are not silently dropped
-        if (groupName == null) return true;
-        try {
-            return groupName.matches(filter);
-        } catch (java.util.regex.PatternSyntaxException e) {
-            LOG.errorf("SCIM [%s] -- Invalid CFG_SYNC_GROUPS_FILTER regex '%s': %s",
-                    t.getName(), filter, e.getMessage());
-            return false;
+
+        if (useRegex) {
+            // Regex mode: null groupName passes to preserve DELETE events for gone groups
+            if (groupName == null) return true;
+            try {
+                return groupName.matches(filter);
+            } catch (java.util.regex.PatternSyntaxException e) {
+                LOG.errorf("SCIM [%s] -- Invalid CFG_SYNC_GROUPS_FILTER regex '%s': %s",
+                        t.getName(), filter, e.getMessage());
+                return false;
+            }
         }
+
+        // Comma-delimited mode (default): null groupName cannot match any name
+        if (groupName == null) return false;
+        Set<String> allowed = Arrays.stream(filter.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .collect(Collectors.toSet());
+        return allowed.contains(groupName);
     }
 
     /** Prefer externalId lookup; fall back to displayName for groups. */
