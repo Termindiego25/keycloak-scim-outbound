@@ -1,5 +1,7 @@
 package es.diegosr.keycloak_scim_outbound;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import es.diegosr.keycloak_scim_outbound.http.ScimClient;
 import es.diegosr.keycloak_scim_outbound.ui.ScimTargetProviderFactory;
 import es.diegosr.keycloak_scim_outbound.util.ScimMapper;
@@ -7,6 +9,7 @@ import es.diegosr.keycloak_scim_outbound.util.ScimMapper;
 import static es.diegosr.keycloak_scim_outbound.ui.ScimTargetProviderFactory.*;
 
 import org.keycloak.component.ComponentModel;
+import org.keycloak.events.Details;
 import org.keycloak.events.Event;
 import org.keycloak.events.EventListenerProvider;
 import org.keycloak.events.EventType;
@@ -35,6 +38,8 @@ import java.util.function.LongSupplier;
  *  - Group membership events (ResourceType.GROUP_MEMBERSHIP) to drive provisioning when filterGroup is set
  */
 public class ScimEventListenerProvider implements EventListenerProvider {
+    private static final ObjectMapper JSON = new ObjectMapper();
+
     private final KeycloakSession session;
     private final BiFunction<String, String, ScimClient> scimClientFactory;
     private final LongSupplier clock;
@@ -81,18 +86,20 @@ public class ScimEventListenerProvider implements EventListenerProvider {
 
         UserModel user = session.users().getUserById(realm, event.getUserId());
         final String userId = (user != null) ? user.getId() : event.getUserId();
-        final String username = (user != null) ? user.getUsername() : "(unknown)";
+        final String username = (user != null)
+                ? user.getUsername()
+                : usernameFromDetails(event.getDetails());
 
         switch (event.getType()) {
-            case REGISTER -> dispatch("CREATE", realm, userId, username, user, event.getDetails());
-            case UPDATE_PROFILE, UPDATE_EMAIL -> dispatch("UPDATE", realm, userId, username, user, event.getDetails());
+            case REGISTER -> dispatch("CREATE", realm, userId, username, user);
+            case UPDATE_PROFILE, UPDATE_EMAIL -> dispatch("UPDATE", realm, userId, username, user);
             case UPDATE_CREDENTIAL -> {
                 Map<String, String> d = event.getDetails();
                 if (d != null && "password".equalsIgnoreCase(d.get("credential_type"))) {
-                    dispatch("UPDATE", realm, userId, username, user, d);
+                    dispatch("UPDATE", realm, userId, username, user);
                 }
             }
-            case DELETE_ACCOUNT -> dispatch("DELETE", realm, userId, username, user, event.getDetails());
+            case DELETE_ACCOUNT -> dispatch("DELETE", realm, userId, username, user);
             default -> {}
         }
     }
@@ -128,7 +135,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
             final UserModel  user  = session.users().getUserById(realm, userId);
             final GroupModel group = session.groups().getGroupById(realm, groupId);
             final String groupName = (group != null ? group.getName() : null);
-            final String username  = (user  != null ? user.getUsername() : "(unknown)");
+            final String username  = (user != null ? user.getUsername() : null);
 
             if (groupName == null) {
                 logInfo("SCIM", "membership", "Group not found for id=%s (path=%s)", groupId, path);
@@ -161,7 +168,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                 // A) Filter-group user provisioning (existing behavior)
                 final String cfgGroup = ScimTargetProviderFactory.get(t, ScimTargetProviderFactory.CFG_FILTER_GROUP, null);
                 if (cfgGroup != null && !cfgGroup.isBlank() && cfgGroup.equals(groupName)) {
-                    if (scimUserName == null || scimUserName.isBlank()) {
+                    if (op != OperationType.DELETE && (scimUserName == null || scimUserName.isBlank())) {
                         logErr("SCIM", t.getName(), "Cannot resolve SCIM userName for user=%s. Skipping filter-group event.", username);
                     } else {
                         try {
@@ -224,14 +231,16 @@ public class ScimEventListenerProvider implements EventListenerProvider {
             final String userId = extractUserId(adminEvent.getResourcePath());
             if (userId == null) return;
 
-            final UserModel user = session.users().getUserById(realm, userId);
-            final String username = (user != null) ? user.getUsername() : "(unknown)";
-
             final OperationType op = adminEvent.getOperationType();
+            final UserModel user = session.users().getUserById(realm, userId);
+            final String username = (user != null)
+                    ? user.getUsername()
+                    : (op == OperationType.DELETE ? usernameFromAdminRepresentation(adminEvent) : null);
+
             switch (op) {
-                case CREATE -> dispatch("CREATE", realm, userId, username, user, null);
-                case UPDATE -> dispatch("UPDATE", realm, userId, username, user, null);
-                case DELETE -> dispatch("DELETE", realm, userId, username, user, null);
+                case CREATE -> dispatch("CREATE", realm, userId, username, user);
+                case UPDATE -> dispatch("UPDATE", realm, userId, username, user);
+                case DELETE -> dispatch("DELETE", realm, userId, username, user);
                 default -> { /* ignore */ }
             }
         }
@@ -330,7 +339,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
 
     /* ===== Core dispatch ===== */
 
-    private void dispatch(String action, RealmModel realm, String userId, String username, UserModel user, Map<String,String> details) {
+    private void dispatch(String action, RealmModel realm, String userId, String username, UserModel user) {
         // Debounce to reduce double delivery (user event + admin event)
         long now = clock.getAsLong();
         if (shouldDebounceUserEvent(realm.getId(), userId, action, now)) return;
@@ -341,6 +350,23 @@ public class ScimEventListenerProvider implements EventListenerProvider {
 
         for (ComponentModel t : targets) {
             handleTarget(t, action, realm, userId, username, user);
+        }
+    }
+
+    private static String usernameFromDetails(Map<String, String> details) {
+        return details == null ? null : nullIfBlank(details.get(Details.USERNAME));
+    }
+
+    private static String usernameFromAdminRepresentation(AdminEvent adminEvent) {
+        String representation = adminEvent.getRepresentation();
+        if (representation == null || representation.isBlank()) return null;
+
+        try {
+            JsonNode username = JSON.readTree(representation).path("username");
+            return username.isTextual() ? nullIfBlank(username.asText()) : null;
+        } catch (Exception e) {
+            logErr("SCIM", "delete", "Could not parse deleted user representation; continuing with externalId only.");
+            return null;
         }
     }
 
@@ -355,7 +381,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         }
 
         final String scimUserName = computeScimUserName(t, user, username);
-        if (scimUserName == null || scimUserName.isBlank()) {
+        if (!"DELETE".equals(action) && (scimUserName == null || scimUserName.isBlank())) {
             logErr("SCIM", t.getName(), "Could not resolve SCIM 'userName' for user=%s. Skipping.", username);
             return;
         }
@@ -396,7 +422,9 @@ public class ScimEventListenerProvider implements EventListenerProvider {
         String strategy = get(t, CFG_UNAME_STRATEGY, "username");
         logInfo("keycloak-scim-outbound", t.getName(), "Using userNameStrategy=%s", strategy);
 
-        if (user == null) return fallbackUsername; // best-effort on deletes
+        if (user == null) {
+            return "username".equals(strategy) ? nullIfBlank(fallbackUsername) : null;
+        }
 
         switch (strategy) {
             case "username":
