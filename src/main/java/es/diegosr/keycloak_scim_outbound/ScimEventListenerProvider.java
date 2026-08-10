@@ -22,6 +22,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiFunction;
+import java.util.function.LongSupplier;
 
 /**
  * Event listener that pushes user lifecycle changes (create/update/delete)
@@ -34,6 +36,8 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public class ScimEventListenerProvider implements EventListenerProvider {
     private final KeycloakSession session;
+    private final BiFunction<String, String, ScimClient> scimClientFactory;
+    private final LongSupplier clock;
 
     private static final Set<EventType> USER_EVENTS_OF_INTEREST = EnumSet.of(
             EventType.REGISTER,
@@ -56,7 +60,15 @@ public class ScimEventListenerProvider implements EventListenerProvider {
     private record MembershipDebounceEntry(OperationType operation, long timestamp) { }
 
     public ScimEventListenerProvider(KeycloakSession session) {
+        this(session, ScimClient::new, () -> Instant.now().toEpochMilli());
+    }
+
+    ScimEventListenerProvider(KeycloakSession session,
+                              BiFunction<String, String, ScimClient> scimClientFactory,
+                              LongSupplier clock) {
         this.session = session;
+        this.scimClientFactory = scimClientFactory;
+        this.clock = clock;
     }
 
     /* ===== User events ===== */
@@ -136,9 +148,9 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                     continue;
                 }
 
-                final ScimClient client = new ScimClient(base, token);
+                final ScimClient client = scimClientFactory.apply(base, token);
                 final OperationType op  = adminEvent.getOperationType();
-                final long now = java.time.Instant.now().toEpochMilli();
+                final long now = clock.getAsLong();
                 if (shouldDebounceMembershipEvent(
                         realm.getId(), userId, groupId, op, t.getId(), now)) {
                     continue;
@@ -251,7 +263,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
                 }
                 if (!"true".equalsIgnoreCase(get(t, CFG_SYNC_GROUPS, "false"))) continue;
                 if (!isGroupAllowedForSync(t, groupName)) continue;
-                final ScimClient client = new ScimClient(base, token);
+                final ScimClient client = scimClientFactory.apply(base, token);
                 try {
                     switch (op) {
                         case CREATE -> {
@@ -320,7 +332,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
 
     private void dispatch(String action, RealmModel realm, String userId, String username, UserModel user, Map<String,String> details) {
         // Debounce to reduce double delivery (user event + admin event)
-        long now = Instant.now().toEpochMilli();
+        long now = clock.getAsLong();
         if (shouldDebounceUserEvent(realm.getId(), userId, action, now)) return;
 
         List<ComponentModel> targets = realm.getComponentsStream()
@@ -360,7 +372,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
             }
         }
 
-        ScimClient client = new ScimClient(base, token);
+        ScimClient client = scimClientFactory.apply(base, token);
 
         try {
             boolean changed = switch (action) {
