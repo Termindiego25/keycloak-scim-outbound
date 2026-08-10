@@ -130,7 +130,7 @@ public class ScimEventListenerProvider implements EventListenerProvider {
 
                 final ScimClient client = new ScimClient(base, token);
                 final OperationType op  = adminEvent.getOperationType();
-                final String debounceKey = "GM:" + realm.getId() + ":" + userId + ":" + groupId + ":" + op;
+                final String debounceKey = "GM:" + realm.getId() + ":" + userId + ":" + groupId + ":" + op + ":" + t.getId();
                 final long now = java.time.Instant.now().toEpochMilli();
                 final Long last = debounce.put(debounceKey, now);
                 if (last != null && (now - last) < DEBOUNCE_MS) continue;
