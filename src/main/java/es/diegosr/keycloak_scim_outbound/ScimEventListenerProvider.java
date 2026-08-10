@@ -130,10 +130,11 @@ public class ScimEventListenerProvider implements EventListenerProvider {
 
                 final ScimClient client = new ScimClient(base, token);
                 final OperationType op  = adminEvent.getOperationType();
-                final String debounceKey = "GM:" + realm.getId() + ":" + userId + ":" + groupId + ":" + op + ":" + t.getId();
                 final long now = java.time.Instant.now().toEpochMilli();
-                final Long last = debounce.put(debounceKey, now);
-                if (last != null && (now - last) < DEBOUNCE_MS) continue;
+                if (shouldDebounceMembershipEvent(
+                        realm.getId(), userId, groupId, op, t.getId(), now)) {
+                    continue;
+                }
 
                 final String scimUserName = computeScimUserName(t, user, username);
 
@@ -284,6 +285,13 @@ public class ScimEventListenerProvider implements EventListenerProvider {
             }
         }
         // other resource types -> ignore
+    }
+
+    boolean shouldDebounceMembershipEvent(String realmId, String userId, String groupId,
+                                           OperationType operation, String targetId, long now) {
+        String key = "GM:" + realmId + ":" + userId + ":" + groupId + ":" + operation + ":" + targetId;
+        Long last = debounce.put(key, now);
+        return last != null && (now - last) < DEBOUNCE_MS;
     }
 
     /* ===== Core dispatch ===== */
