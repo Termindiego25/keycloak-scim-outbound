@@ -63,19 +63,23 @@ public class ScimClient {
 
         try {
             String filter = attribute + " eq " + scimFilterString(value);
-            String query = "filter=" + urlEncode(filter);
+            String query = lookupQuery(filter, attribute);
             HttpRequest req = baseRequestBuilder("/Users?" + query).GET().build();
 
             HttpResponse<String> res = sendWithRetries(req);
             if (is2xx(res.statusCode())) {
                 String body = res.body();
-                ScimListResponse users = parseListResponse(body);
+                ScimListResponse users = parseListResponse(body, attribute, value);
                 httpInfo("GET /Users?%s -> %d totalResults=%d", query, res.statusCode(), users.totalResults());
-                if (users.firstId().isPresent()) {
-                    return users.firstId();
+                if (users.matchingId().isPresent()) {
+                    return users.matchingId();
                 }
-                if (users.totalResults() > 0 || users.resourcesPresent()) {
-                    httpErr("Could not extract user id from SCIM response (Resources present but no id found).");
+                if (!users.standardShape()) {
+                    httpErr("Could not parse a standard SCIM ListResponse.");
+                } else if (users.matchingResources() > 1) {
+                    httpErr("Refusing ambiguous SCIM response: multiple Users match attribute %s.", attribute);
+                } else if (users.totalResults() > 0 || users.resourcesPresent()) {
+                    httpErr("Could not find a User whose %s matches the requested value and has an id.", attribute);
                 }
             } else {
                 httpErr("GET /Users?%s -> %d %s", query, res.statusCode(), safeBody(res));
@@ -86,25 +90,64 @@ public class ScimClient {
         return Optional.empty();
     }
 
-    private static ScimListResponse parseListResponse(String body) throws Exception {
+    static ScimListResponse parseListResponse(String body, String attribute, String expectedValue) throws Exception {
         if (body == null || body.isBlank()) {
-            return new ScimListResponse(0, Optional.empty(), false);
+            return new ScimListResponse(0, Optional.empty(), 0, 0, false);
         }
 
         JsonNode root = JSON.readTree(body);
+        if (!root.isObject()) {
+            return new ScimListResponse(0, Optional.empty(), 0, 0, false);
+        }
+
         int totalResults = root.path("totalResults").asInt(0);
         JsonNode resources = root.path("Resources");
-        boolean resourcesPresent = resources.isArray() && !resources.isEmpty();
-
-        if (!resourcesPresent) {
-            return new ScimListResponse(totalResults, Optional.empty(), false);
+        boolean standardShape = root.path("totalResults").canConvertToInt()
+                && (totalResults == 0 || resources.isArray());
+        if (!resources.isArray() || resources.isEmpty()) {
+            return new ScimListResponse(totalResults, Optional.empty(), 0, 0, standardShape);
         }
 
-        JsonNode id = resources.get(0).path("id");
-        if (id.isTextual() && !id.asText().isBlank()) {
-            return new ScimListResponse(totalResults, Optional.of(id.asText()), true);
+        String matchingId = null;
+        int matchingResources = 0;
+        for (JsonNode resource : resources) {
+            JsonNode candidate = findAttribute(resource, attribute);
+            if (candidate == null || !candidate.isTextual()
+                    || !attributeValueMatches(attribute, candidate.asText(), expectedValue)) {
+                continue;
+            }
+
+            matchingResources++;
+            JsonNode id = findAttribute(resource, "id");
+            if (matchingResources == 1 && id != null && id.isTextual() && !id.asText().isBlank()) {
+                matchingId = id.asText();
+            }
         }
-        return new ScimListResponse(totalResults, Optional.empty(), true);
+
+        Optional<String> uniqueId = matchingResources == 1
+                ? Optional.ofNullable(matchingId)
+                : Optional.empty();
+        return new ScimListResponse(
+                totalResults, uniqueId, resources.size(), matchingResources, standardShape);
+    }
+
+    private static JsonNode findAttribute(JsonNode resource, String attribute) {
+        JsonNode direct = resource.get(attribute);
+        if (direct != null) return direct;
+
+        var fields = resource.fields();
+        while (fields.hasNext()) {
+            var field = fields.next();
+            if (field.getKey().equalsIgnoreCase(attribute)) return field.getValue();
+        }
+        return null;
+    }
+
+    private static boolean attributeValueMatches(String attribute, String actual, String expected) {
+        if (actual == null || expected == null) return false;
+        return "externalId".equals(attribute)
+                ? actual.equals(expected)
+                : actual.equalsIgnoreCase(expected);
     }
 
     /** Create SCIM user; returns true on 201/200. */
@@ -165,13 +208,22 @@ public class ScimClient {
         if (value == null || value.isBlank()) return Optional.empty();
         try {
             String filter = attribute + " eq " + scimFilterString(value);
-            String query = "filter=" + urlEncode(filter);
+            String query = lookupQuery(filter, attribute);
             HttpRequest req = baseRequestBuilder("/Groups?" + query).GET().build();
             HttpResponse<String> res = sendWithRetries(req);
             if (is2xx(res.statusCode())) {
-                ScimListResponse groups = parseListResponse(res.body());
+                ScimListResponse groups = parseListResponse(res.body(), attribute, value);
                 httpInfo("GET /Groups?%s -> %d totalResults=%d", query, res.statusCode(), groups.totalResults());
-                return groups.firstId();
+                if (groups.matchingId().isPresent()) {
+                    return groups.matchingId();
+                }
+                if (!groups.standardShape()) {
+                    httpErr("Could not parse a standard SCIM ListResponse.");
+                } else if (groups.matchingResources() > 1) {
+                    httpErr("Refusing ambiguous SCIM response: multiple Groups match attribute %s.", attribute);
+                } else if (groups.totalResults() > 0 || groups.resourcesPresent()) {
+                    httpErr("Could not find a Group whose %s matches the requested value and has an id.", attribute);
+                }
             } else {
                 httpErr("GET /Groups?%s -> %d %s", query, res.statusCode(), safeBody(res));
             }
@@ -284,6 +336,9 @@ public class ScimClient {
     private static String trimTrailingSlash(String s) { if (s == null || s.isEmpty()) return s; return s.endsWith("/") ? s.substring(0, s.length() - 1) : s; }
     private static String userPath(String id)  { return "/Users/"  + urlEncode(id); }
     private static String groupPath(String id) { return "/Groups/" + urlEncode(id); }
+    private static String lookupQuery(String filter, String attribute) {
+        return "filter=" + urlEncode(filter) + "&attributes=" + urlEncode("id," + attribute);
+    }
     private static String urlEncode(String s) { return URLEncoder.encode(s, StandardCharsets.UTF_8).replace("+", "%20"); }
     private static void sleep(long ms) { try { Thread.sleep(ms); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); } }
     private static String safeBody(HttpResponse<String> res) { String b = res.body(); return b == null ? "" : (b.length() > 400 ? b.substring(0, 400) + " …" : b); }
@@ -318,5 +373,10 @@ public class ScimClient {
     private static void httpInfo(String fmt, Object... args) { System.out.printf("%s [keycloak-scim-outbound/HTTP] %s%n", now(), String.format(fmt, args)); }
     private static void httpErr(String fmt, Object... args)  { System.err.printf("%s [keycloak-scim-outbound/HTTP] %s%n", now(), String.format(fmt, args)); }
 
-    private record ScimListResponse(int totalResults, Optional<String> firstId, boolean resourcesPresent) {}
+    record ScimListResponse(int totalResults, Optional<String> matchingId, int resourceCount,
+                            int matchingResources, boolean standardShape) {
+        boolean resourcesPresent() {
+            return resourceCount > 0;
+        }
+    }
 }
